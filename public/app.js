@@ -71,6 +71,12 @@
   var ui = {};      // element handles, filled by buildUI()
   var ctx = null, masterGain = null;
 
+  var FILTER_TYPES = ["off", "lowpass", "bandpass", "highpass"];
+  var FILTER_SHORT = { off: "OFF", lowpass: "LP", bandpass: "BP", highpass: "HP" };
+  var FREQ_MIN = 80, FREQ_MAX = 12000;
+  function freqToSlider(f) { return 100 * Math.log(f / FREQ_MIN) / Math.log(FREQ_MAX / FREQ_MIN); }
+  function sliderToFreq(s) { return FREQ_MIN * Math.pow(FREQ_MAX / FREQ_MIN, s / 100); }
+
   // ---------------- helpers ----------------
   function el(tag, cls, parent) {
     var e = document.createElement(tag);
@@ -85,7 +91,10 @@
       localStorage.setItem("sp1200", JSON.stringify({
         bpm: state.bpm, swing: state.swing, master: state.master, spMode: state.spMode,
         pattern: state.pattern,
-        pads: state.pads.map(function (p) { return { tune: p.tune, level: p.level, muted: p.muted }; }),
+        pads: state.pads.map(function (p) { return {
+          tune: p.tune, level: p.level, muted: p.muted,
+          filterType: p.filterType, filterFreq: p.filterFreq, filterQ: p.filterQ,
+        }; }),
       }));
     } catch (e) { /* private mode etc. */ }
   }
@@ -103,6 +112,9 @@
         state.pads[i].tune = clamp(ps.tune || 1, 0.5, 2);
         state.pads[i].level = clamp(ps.level == null ? 0.9 : ps.level, 0, 1);
         state.pads[i].muted = !!ps.muted;
+        if (ps.filterType && FILTER_TYPES.indexOf(ps.filterType) >= 0) state.pads[i].filterType = ps.filterType;
+        if (typeof ps.filterFreq === "number") state.pads[i].filterFreq = clamp(ps.filterFreq, FREQ_MIN, FREQ_MAX);
+        if (typeof ps.filterQ === "number") state.pads[i].filterQ = clamp(ps.filterQ, 0.5, 8);
       });
     } catch (e) { /* corrupted save */ }
   }
@@ -140,7 +152,16 @@
     src.playbackRate.value = p.tune; // varispeed, exactly like the hardware
     var g = ctx.createGain();
     g.gain.value = p.level;
-    src.connect(g);
+    if (p.filterType !== "off") {
+      var flt = ctx.createBiquadFilter();
+      flt.type = p.filterType; // lowpass | bandpass | highpass
+      flt.frequency.value = p.filterFreq;
+      flt.Q.value = p.filterQ;
+      src.connect(flt);
+      flt.connect(g);
+    } else {
+      src.connect(g);
+    }
     g.connect(masterGain);
     src.start(when == null ? 0 : when);
     flashPad(idx);
@@ -205,6 +226,9 @@
         p.dataClean = DSP.normalize(clean, 0.92);
         p.customName = (file.name || "sample").replace(/\.\w+$/, "").slice(0, 12).toUpperCase();
         ui.padNames[padIdx].textContent = p.customName;
+        p._undo = null;
+        p.selStart = 0; p.selEnd = 1;
+        if (ui.edOpenFor === padIdx) syncEditor();
         playPad(padIdx);
         save();
       };
@@ -221,8 +245,230 @@
     p.dataSP = DSP.SYNTHS[p.def.id]();
     p.dataClean = DSP.SYNTHS_RAW[p.def.id]();
     p.customName = null;
+    p._undo = null;
+    p.selStart = 0; p.selEnd = 1;
+    setFilterType(padIdx, "off");
+    p.filterFreq = FREQ_MAX; p.filterQ = 0.8;
+    if (ui.edOpenFor === padIdx) syncEditor();
     ui.padNames[padIdx].textContent = p.def.name;
     save();
+  }
+
+  // ---------------- per-pad filters + sample editor ----------------
+  function setFilterType(i, t) {
+    var p = state.pads[i];
+    if (!p) return;
+    p.filterType = t;
+    var b = ui["padFlt" + i];
+    if (b) {
+      b.textContent = "FLT " + FILTER_SHORT[t];
+      b.classList.toggle("on", t !== "off");
+    }
+    if (ui.edOpenFor === i) paintFilterTypes();
+  }
+  function cycleFilter(i) {
+    var p = state.pads[i];
+    setFilterType(i, FILTER_TYPES[(FILTER_TYPES.indexOf(p.filterType) + 1) % FILTER_TYPES.length]);
+    save();
+  }
+
+  // Re-derive the 12-bit SP buffer from the edited clean sample.
+  function refreshSample(i) {
+    var p = state.pads[i];
+    var sp = DSP.resampleLinear(p.dataClean, DSP.SYNTH_RATE, DSP.SP_RATE);
+    p.dataSP = DSP.quantize12(sp);
+  }
+  function pushUndo(p) {
+    if (p.dataClean.length > 2000000) return; // skip huge samples
+    if (!p._undo) p._undo = [];
+    p._undo.push(p.dataClean.slice());
+    if (p._undo.length > 10) p._undo.shift();
+  }
+  function commitEdit(i) {
+    var p = state.pads[i];
+    refreshSample(i);
+    p.selStart = 0; p.selEnd = 1;
+    drawWave();
+    playPad(i); // audition the edit
+    save();
+  }
+
+  var ed = null; // lazily built editor handles
+  function buildEditor() {
+    var root = el("div", "overlay", document.body);
+    root.style.display = "none";
+    var panel = el("div", "editor", root);
+    var head = el("div", "ed-head", panel);
+    var title = el("div", "ed-title", head);
+    var x = el("button", "btn ed-x", head);
+    x.textContent = "\u00d7";
+    x.setAttribute("aria-label", "Close sample editor");
+    x.addEventListener("click", closeEditor);
+    root.addEventListener("click", function (e) { if (e.target === root) closeEditor(); });
+
+    var cv = el("canvas", "wave", panel);
+    cv.width = 640; cv.height = 160;
+
+    var info = el("div", "ed-info", panel);
+
+    // drag on the waveform to set the trim selection
+    var dragging = false;
+    function frac(e) {
+      var r = (cv.getBoundingClientRect) ? cv.getBoundingClientRect() : { left: 0, width: cv.width };
+      var cx = (e.clientX - r.left) / (r.width || 1);
+      return clamp(cx, 0, 1);
+    }
+    cv.addEventListener("pointerdown", function (e) {
+      var p = state.pads[ui.edOpenFor];
+      if (!p) return;
+      dragging = true;
+      p.selStart = p.selEnd = frac(e);
+      drawWave();
+      if (e.preventDefault) e.preventDefault();
+    });
+    cv.addEventListener("pointermove", function (e) {
+      if (!dragging) return;
+      var p = state.pads[ui.edOpenFor];
+      if (!p) return;
+      p.selEnd = frac(e);
+      drawWave();
+    });
+    cv.addEventListener("pointerup", function () { dragging = false; });
+
+    var ops = el("div", "ed-ops", panel);
+    function opBtn(label, fn, aria) {
+      var b = el("button", "btn", ops);
+      b.textContent = label;
+      b.setAttribute("aria-label", aria || label);
+      b.addEventListener("click", fn);
+      return b;
+    }
+    opBtn("TRIM", function () {
+      var i = ui.edOpenFor, p = state.pads[i];
+      var a = Math.min(p.selStart, p.selEnd), b = Math.max(p.selStart, p.selEnd);
+      if (b - a < 0.002) return; // nothing selected
+      pushUndo(p);
+      p.dataClean = DSP.trimSample(p.dataClean, a, b);
+      commitEdit(i);
+    }, "Crop sample to selection");
+    opBtn("NORM", function () {
+      var i = ui.edOpenFor, p = state.pads[i];
+      pushUndo(p);
+      DSP.normalize(p.dataClean, 0.92);
+      commitEdit(i);
+    }, "Normalize sample peak");
+    opBtn("REVERSE", function () {
+      var i = ui.edOpenFor, p = state.pads[i];
+      pushUndo(p);
+      p.dataClean = DSP.reverseSample(p.dataClean);
+      commitEdit(i);
+    }, "Reverse sample");
+    opBtn("FADE IN", function () {
+      var i = ui.edOpenFor, p = state.pads[i];
+      pushUndo(p);
+      p.dataClean = DSP.fadeSample(p.dataClean, 0.05, 0);
+      commitEdit(i);
+    }, "Fade in over first 5 percent");
+    opBtn("FADE OUT", function () {
+      var i = ui.edOpenFor, p = state.pads[i];
+      pushUndo(p);
+      p.dataClean = DSP.fadeSample(p.dataClean, 0, 0.05);
+      commitEdit(i);
+    }, "Fade out over last 5 percent");
+    opBtn("UNDO", function () {
+      var i = ui.edOpenFor, p = state.pads[i];
+      if (p._undo && p._undo.length) {
+        p.dataClean = p._undo.pop();
+        commitEdit(i);
+      }
+    }, "Undo last edit");
+
+    var fsec = el("div", "ed-filter", panel);
+    var flab = el("div", "ed-flab", fsec);
+    flab.textContent = "FILTER";
+    var ftypes = el("div", "ed-ftypes", fsec);
+    var ftypeBtns = {};
+    FILTER_TYPES.forEach(function (t) {
+      var b = el("button", "btn", ftypes);
+      b.textContent = FILTER_SHORT[t];
+      b.setAttribute("aria-label", "Filter type " + t);
+      b.addEventListener("click", function () { setFilterType(ui.edOpenFor, t); save(); });
+      ftypeBtns[t] = b;
+    });
+    var cutoff = makeSlider(fsec, "CUTOFF", 0, 100, 1, 100,
+      function (v) { return Math.round(sliderToFreq(v)) + " Hz"; },
+      function (v) { state.pads[ui.edOpenFor].filterFreq = sliderToFreq(v); save(); });
+    var reso = makeSlider(fsec, "RESO", 5, 80, 1, 8,
+      function (v) { return (v / 10).toFixed(1); },
+      function (v) { state.pads[ui.edOpenFor].filterQ = v / 10; save(); });
+
+    ed = { root: root, title: title, canvas: cv, info: info, ftypeBtns: ftypeBtns, cutoff: cutoff, reso: reso };
+  }
+  function paintFilterTypes() {
+    if (!ed) return;
+    var t = state.pads[ui.edOpenFor].filterType;
+    FILTER_TYPES.forEach(function (k) { ed.ftypeBtns[k].classList.toggle("on", k === t); });
+  }
+  function syncEditor() {
+    // refresh the editor for the currently open pad (after load/reset)
+    if (!ed || ui.edOpenFor == null || ui.edOpenFor < 0) return;
+    var p = state.pads[ui.edOpenFor];
+    ed.title.textContent = "SAMPLE EDIT — " + (p.customName || p.def.name);
+    paintFilterTypes();
+    ed.cutoff.set(freqToSlider(p.filterFreq));
+    ed.reso.set(p.filterQ * 10);
+    drawWave();
+  }
+  function openEditor(i) {
+    if (!ed) buildEditor();
+    ui.edOpenFor = i;
+    var p = state.pads[i];
+    p.selStart = 0; p.selEnd = 1;
+    syncEditor();
+    ed.root.style.display = "flex";
+  }
+  function closeEditor() {
+    if (ed) ed.root.style.display = "none";
+    ui.edOpenFor = -1;
+  }
+  function drawWave() {
+    if (!ed || ui.edOpenFor == null || ui.edOpenFor < 0) return;
+    var p = state.pads[ui.edOpenFor];
+    var cv = ed.canvas;
+    var g2d = cv.getContext && cv.getContext("2d");
+    if (!g2d) return;
+    var W = cv.width, H = cv.height, d = p.dataClean;
+    g2d.fillStyle = "#060907";
+    g2d.fillRect(0, 0, W, H);
+    var mid = H / 2, amp = H * 0.46;
+    g2d.strokeStyle = "#ffb000";
+    g2d.lineWidth = 1;
+    g2d.beginPath();
+    for (var x = 0; x < W; x++) {
+      var a = Math.floor(x / W * d.length);
+      var b = Math.max(a + 1, Math.floor((x + 1) / W * d.length));
+      var mn = 1, mx = -1;
+      for (var k = a; k < b && k < d.length; k++) {
+        var v = d[k];
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+      }
+      if (mx < mn) { mx = 0; mn = 0; }
+      g2d.moveTo(x + 0.5, mid - mx * amp);
+      g2d.lineTo(x + 0.5, mid - mn * amp + 0.5);
+    }
+    g2d.stroke();
+    var s0 = Math.min(p.selStart, p.selEnd) * W, s1 = Math.max(p.selStart, p.selEnd) * W;
+    g2d.fillStyle = "rgba(0,0,0,0.55)";
+    g2d.fillRect(0, 0, s0, H);
+    g2d.fillRect(s1, 0, W - s1, H);
+    g2d.fillStyle = "#ffd47a";
+    g2d.fillRect(s0 - 1, 0, 2, H);
+    g2d.fillRect(s1 - 1, 0, 2, H);
+    var secs = d.length / DSP.SYNTH_RATE;
+    ed.info.textContent = secs.toFixed(2) + "s \u00b7 " + d.length + " samples \u00b7 sel " +
+      (Math.min(p.selStart, p.selEnd) * secs).toFixed(2) + "\u2013" +
+      (Math.max(p.selStart, p.selEnd) * secs).toFixed(2) + "s \u00b7 drag to select, TRIM crops";
   }
 
   // ---------------- UI ----------------
@@ -281,6 +527,7 @@
     var mount = (document.querySelector && document.querySelector(".chassis")) || document.body;
     var app = el("div", "", mount);
     app.id = "app";
+    ui.edOpenFor = -1;
 
     // ---- transport ----
     var top = el("div", "top", app);
@@ -396,7 +643,18 @@
       resetBtn.setAttribute("aria-label", "Reset " + def.name + " to built-in drum");
       resetBtn.addEventListener("click", function () { resetPad(i); });
 
+      var row2 = el("div", "pbtns sub", card);
+      var editBtn = el("button", "btn", row2);
+      editBtn.textContent = "EDIT";
+      editBtn.setAttribute("aria-label", "Open sample editor for " + def.name);
+      editBtn.addEventListener("click", function () { openEditor(i); });
+      var fltBtn = el("button", "btn", row2);
+      fltBtn.setAttribute("aria-label", "Cycle filter type for " + def.name);
+      fltBtn.addEventListener("click", function () { cycleFilter(i); });
+
       ui["padTune" + i] = tune; ui["padLevel" + i] = level; ui["padMute" + i] = muteBtn;
+      ui["padEdit" + i] = editBtn; ui["padFlt" + i] = fltBtn;
+      setFilterType(i, state.pads[i].filterType);
     });
 
     // ---- sequencer ----
@@ -457,6 +715,7 @@
     // ---- keyboard ----
     document.addEventListener("keydown", function (e) {
       if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
+      if (e.code === "Escape") { closeEditor(); return; }
       if (e.code === "Space") {
         e.preventDefault();
         if (state.playing) stopTransport(); else startTransport();
@@ -488,6 +747,8 @@
         dataSP: DSP.SYNTHS[def.id](),
         dataClean: DSP.SYNTHS_RAW[def.id](),
         tune: 1, level: 0.9, muted: false, customName: null,
+        filterType: "off", filterFreq: FREQ_MAX, filterQ: 0.8,
+        selStart: 0, selEnd: 1, _undo: null,
       });
       state.pattern.push(new Array(STEPS).fill(0));
     });
@@ -506,6 +767,7 @@
         ui["padTune" + i].set(p.tune * 100);
         ui["padLevel" + i].set(p.level * 100);
         ui["padMute" + i].classList.toggle("on", p.muted);
+        setFilterType(i, p.filterType);
         ui.padCards[i].classList.toggle("muted", p.muted);
         ui.seqRows[i].classList.toggle("muted", p.muted);
         ui.seqMutes[i].classList.toggle("on", p.muted);
@@ -518,7 +780,10 @@
   var api = { init: init, state: state, ui: ui, applyPreset: applyPreset, PAD_DEFS: PAD_DEFS, PRESETS: PRESETS,
     _playPad: function (i, w) { return playPad(i, w); },
     _scheduleStep: function (s, t) { return scheduleStep(s, t); },
-    _start: startTransport, _stop: stopTransport };
+    _start: startTransport, _stop: stopTransport,
+    _setFilterType: setFilterType, _cycleFilter: cycleFilter,
+    _openEditor: openEditor, _closeEditor: closeEditor,
+    _refreshSample: refreshSample, _drawWave: drawWave };
   if (typeof window !== "undefined") window.SP1200 = api;
   else globalThis.SP1200 = api;
 

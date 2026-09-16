@@ -211,10 +211,38 @@
     return step % 2 === 0 ? pairStart : pairStart + s * 2 * d;
   }
 
+  // ---------- sample editing (pure ops, used by the sample editor) ----------
+
+  // Crop to a fractional selection [startFrac, endFrac).
+  function trimSample(x, startFrac, endFrac) {
+    const n = x.length;
+    const a = Math.max(0, Math.min(n, Math.floor(startFrac * n)));
+    const b = Math.max(a + 1, Math.min(n, Math.ceil(endFrac * n)));
+    return x.slice(a, b);
+  }
+
+  function reverseSample(x) {
+    const out = Float32Array.from(x);
+    out.reverse();
+    return out;
+  }
+
+  // Linear fades; fractions of total length (0 = no fade on that side).
+  function fadeSample(x, fadeInFrac, fadeOutFrac) {
+    const out = Float32Array.from(x);
+    const n = out.length;
+    const fi = Math.floor(fadeInFrac * n);
+    const fo = Math.floor(fadeOutFrac * n);
+    for (let i = 0; i < fi && i < n; i++) out[i] *= i / Math.max(1, fi);
+    for (let i = 0; i < fo && i < n; i++) out[n - 1 - i] *= i / Math.max(1, fo);
+    return out;
+  }
+
   return {
     SP_RATE, SP_BITS, SYNTH_RATE, SYNTHS, SYNTHS_RAW,
     resampleLinear, quantize12, sp1200ize,
     lowpass, highpass, normalize,
+    trimSample, reverseSample, fadeSample,
     sixteenthDur, stepTime16,
   };
 });
