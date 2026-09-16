@@ -526,5 +526,90 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
   ok(Math.abs(SP.state.pads[0]._delay.wet.gain.value - SP.state.pads[0].delay.mix) < 1e-9, "delay restores itself on the next hit");
   SP.state.pads[0].delay.on = false;
 
+  // ---- projects: save / load ----
+  ok(ui.projBtn.textContent === "PROJECT", "transport has a PROJECT button");
+  ok(ui.projPanel.style.display === "none", "project panel starts hidden");
+  ui.projBtn.click();
+  ok(ui.projPanel.style.display === "flex", "PROJECT opens the panel");
+  listeners.keydown({ code: "Escape", target: {} });
+  ok(ui.projPanel.style.display === "none", "Escape closes the project panel");
+
+  // pcm16 base64 round-trip
+  const rt = new Float32Array([0, 0.5, -0.5, 1, -1, 0.123456, -0.987654]);
+  const rtBack = SP._pcm16B64ToF32(SP._f32ToPcm16B64(rt));
+  ok(rtBack.length === rt.length, "pcm16 base64 round-trips the length");
+  ok(Array.from(rtBack).every(function (v, i) { return Math.abs(v - rt[i]) < 1 / 32767; }), "pcm16 base64 round-trips the samples");
+
+  // distinctive project state
+  SP.state.bpm = 100; SP.state.swing = 70; SP.state.master = 64; SP.state.spMode = false;
+  SP.state.pattern.forEach(function (row) { row.fill(0); });
+  SP.state.pattern[3][5] = 1; SP.state.pattern[7][15] = 1;
+  const sp0 = SP.state.pads[0];
+  sp0.tune = 1.5; sp0.level = 0.4; sp0.muted = true;
+  sp0.filterType = "lowpass"; sp0.filterFreq = 800; sp0.filterQ = 2;
+  sp0.voiceMode = "mono"; sp0.choke = 2;
+  sp0.delay.on = true; sp0.delay.time = 0.5; sp0.delay.feedback = 0.6; sp0.delay.mix = 0.45;
+  const sp1 = SP.state.pads[1];
+  sp1.dataClean = new Float32Array([0.1, -0.2, 0.3, -0.4, 0.5]);
+  sp1.customName = "MYSMPL";
+  SP._bounceToTape(0);
+  await new Promise(function (r) { setTimeout(r, 60); });
+  ok(!!(SP.state.tapes[0] && SP.state.tapes[0].buffer), "track 1 has audio before the project save");
+  const tapeLen = SP.state.tapes[0].buffer.length;
+  SP._saveProject("projtest");
+  ok(!!SP._listProjects().projtest, "saved project appears in the index");
+  ok(ui.projStatus.textContent.indexOf("projtest") >= 0, "save reports its status");
+
+  // mutate everything, then load
+  SP.state.bpm = 60; SP.state.swing = 50; SP.state.master = 80; SP.state.spMode = true;
+  SP.state.pattern.forEach(function (row) { row.fill(0); });
+  sp0.tune = 1; sp0.muted = false; sp0.filterType = "off"; sp0.voiceMode = "poly"; sp0.delay.on = false;
+  sp1.dataClean = new Float32Array([0]); sp1.customName = null;
+  SP._tapeStopAll();
+  SP.state.tapes[0].buffer = null;
+  SP._loadProject("projtest");
+  ok(SP.state.bpm === 100, "project load restores bpm");
+  ok(SP.state.swing === 70 && SP.state.master === 64 && SP.state.spMode === false, "project load restores transport scalars");
+  ok(SP.state.pattern[3][5] === 1 && SP.state.pattern[7][15] === 1 && SP.state.pattern[0][0] === 0, "project load restores the pattern");
+  const q0 = SP.state.pads[0];
+  ok(Math.abs(q0.tune - 1.5) < 1e-9 && q0.muted === true && q0.filterType === "lowpass" &&
+     q0.filterFreq === 800 && q0.filterQ === 2, "project load restores pad strip settings");
+  ok(q0.voiceMode === "mono" && q0.choke === 2, "project load restores voice mode + choke");
+  ok(q0.delay.on === true && Math.abs(q0.delay.time - 0.5) < 1e-9 &&
+     Math.abs(q0.delay.feedback - 0.6) < 1e-9 && Math.abs(q0.delay.mix - 0.45) < 1e-9, "project load restores delay settings");
+  const q1 = SP.state.pads[1];
+  ok(q1.customName === "MYSMPL", "project load restores the custom sample name");
+  ok(q1.dataClean.length === 5 && Math.abs(q1.dataClean[4] - 0.5) < 1 / 32767, "project load restores custom sample data");
+  ok(!!q1.dataSP && q1.dataSP.length > 0, "project load re-runs the SP conversion on the custom sample");
+  const qt = SP.state.tapes[0];
+  ok(!!(qt.buffer && qt.buffer.getChannelData(0).length === tapeLen), "project load restores tape audio");
+  // UI follows the loaded state
+  ok(ui.stepBtns[3][5].classList.contains("on") && ui.stepBtns[7][15].classList.contains("on"), "loaded pattern shows on the grid");
+  ok(!ui.stepBtns[0][0].classList.contains("on"), "cleared steps stay off on the grid");
+  ok(ui.padNames[1].textContent === "MYSMPL", "loaded custom name shows on the strip");
+  ok(ui.padNames[0].textContent === SP.state.pads[0].def.name, "built-in pad name restores on the strip");
+
+  // loading silences playback
+  SP._playPad(0);
+  SP._tapePlay(0);
+  ok(SP._anyTapePlaying(), "tape playing before the load-silence check");
+  SP._loadProject("projtest");
+  ok(!SP._anyTapePlaying(), "project load stops tape playback");
+  ok(SP.state.pads[0]._voices.length === 0, "project load clears pad voices");
+
+  // list + delete
+  SP._saveProject("second");
+  ok(!!SP._listProjects().projtest && !!SP._listProjects().second, "index lists both saves");
+  ui.projList.children.length = 0; // stub: innerHTML="" doesn't drop stub children
+  SP._paintProjects();
+  ok(ui.projList.children.length === 2, "panel lists two projects");
+  SP._deleteProject("second");
+  ok(!SP._listProjects().second && !!SP._listProjects().projtest, "delete removes one project");
+  ui.projList.children.length = 0;
+  SP._paintProjects();
+  ok(ui.projList.children.length === 1, "panel list updates after delete");
+  SP._deleteProject("projtest");
+  ok(Object.keys(SP._listProjects()).length === 0, "index empty after cleanup");
+
   console.log("\nui: " + n + " passed");
 })().catch(function (e) { console.error("TAPE TESTS FAILED:", e); process.exit(1); });

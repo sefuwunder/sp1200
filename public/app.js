@@ -87,17 +87,114 @@
   }
   function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
 
+  // ---- compact binary <-> text helpers (pure JS, no btoa dependency) ----
+  var B64ABC = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  function bytesToB64(bytes) {
+    var s = "", i, n;
+    for (i = 0; i + 2 < bytes.length; i += 3) {
+      n = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
+      s += B64ABC[(n >> 18) & 63] + B64ABC[(n >> 12) & 63] + B64ABC[(n >> 6) & 63] + B64ABC[n & 63];
+    }
+    var rem = bytes.length - i;
+    if (rem === 1) {
+      n = bytes[i] << 16;
+      s += B64ABC[(n >> 18) & 63] + B64ABC[(n >> 12) & 63] + "==";
+    } else if (rem === 2) {
+      n = (bytes[i] << 16) | (bytes[i + 1] << 8);
+      s += B64ABC[(n >> 18) & 63] + B64ABC[(n >> 12) & 63] + B64ABC[(n >> 6) & 63] + "=";
+    }
+    return s;
+  }
+  function b64ToBytes(b64) {
+    var rev = {}, k;
+    for (k = 0; k < 64; k++) rev[B64ABC.charAt(k)] = k;
+    var pad = 0;
+    if (b64.charAt(b64.length - 1) === "=") pad++;
+    if (b64.charAt(b64.length - 2) === "=") pad++;
+    var out = new Uint8Array((b64.length * 3 >> 2) - pad), j = 0, i;
+    for (i = 0; i < b64.length; i += 4) {
+      var a = rev[b64.charAt(i)], b = rev[b64.charAt(i + 1)];
+      var c = b64.charAt(i + 2) === "=" ? 0 : rev[b64.charAt(i + 2)];
+      var d = b64.charAt(i + 3) === "=" ? 0 : rev[b64.charAt(i + 3)];
+      var n = (a << 18) | (b << 12) | (c << 6) | d;
+      out[j++] = (n >> 16) & 255;
+      if (j < out.length) out[j++] = (n >> 8) & 255;
+      if (j < out.length) out[j++] = n & 255;
+    }
+    return out;
+  }
+  // Float32Array <-> base64 of 16-bit PCM (halves the size of float storage)
+  function f32ToPcm16B64(data) {
+    var bytes = new Uint8Array(data.length * 2);
+    for (var i = 0; i < data.length; i++) {
+      var v = data[i] < -1 ? -1 : data[i] > 1 ? 1 : data[i];
+      var s = v < 0 ? Math.round(v * 32768) : Math.round(v * 32767);
+      if (s < 0) s += 65536;
+      bytes[i * 2] = s & 255;
+      bytes[i * 2 + 1] = (s >> 8) & 255;
+    }
+    return bytesToB64(bytes);
+  }
+  function pcm16B64ToF32(b64) {
+    var bytes = b64ToBytes(b64), n = bytes.length >> 1, out = new Float32Array(n);
+    for (var i = 0; i < n; i++) {
+      var s = bytes[i * 2] | (bytes[i * 2 + 1] << 8);
+      if (s >= 32768) s -= 65536;
+      out[i] = s < 0 ? s / 32768 : s / 32767;
+    }
+    return out;
+  }
+
+  function applyScalars(s) {
+    if (!s) return;
+    if (s.bpm) state.bpm = clamp(s.bpm, 60, 200);
+    if (s.swing) state.swing = clamp(s.swing, 50, 75);
+    if (typeof s.master === "number") state.master = clamp(s.master, 0, 100);
+    if (typeof s.spMode === "boolean") state.spMode = s.spMode;
+    if (Array.isArray(s.pattern) && s.pattern.length === PAD_DEFS.length) {
+      state.pattern = s.pattern.map(function (row) {
+        var r = new Array(STEPS).fill(0);
+        if (Array.isArray(row)) for (var i = 0; i < Math.min(row.length, STEPS); i++) r[i] = row[i] ? 1 : 0;
+        return r;
+      });
+    }
+  }
+  function applyPadSettings(i, ps) {
+    if (!state.pads[i] || !ps) return;
+    state.pads[i].tune = clamp(ps.tune || 1, 0.5, 2);
+    state.pads[i].level = clamp(ps.level == null ? 0.9 : ps.level, 0, 1);
+    state.pads[i].muted = !!ps.muted;
+    if (ps.filterType && FILTER_TYPES.indexOf(ps.filterType) >= 0) state.pads[i].filterType = ps.filterType;
+    if (typeof ps.filterFreq === "number") state.pads[i].filterFreq = clamp(ps.filterFreq, FREQ_MIN, FREQ_MAX);
+    if (typeof ps.filterQ === "number") state.pads[i].filterQ = clamp(ps.filterQ, 0.5, 8);
+    if (ps.voiceMode === "mono" || ps.voiceMode === "poly") state.pads[i].voiceMode = ps.voiceMode;
+    if (typeof ps.choke === "number") state.pads[i].choke = clamp(Math.round(ps.choke), 0, 3);
+    if (ps.delay) {
+      var d = state.pads[i].delay;
+      d.on = !!ps.delay.on;
+      if (typeof ps.delay.time === "number") d.time = clamp(ps.delay.time, 0.03, 1);
+      if (typeof ps.delay.feedback === "number") d.feedback = clamp(ps.delay.feedback, 0, 0.85);
+      if (typeof ps.delay.mix === "number") d.mix = clamp(ps.delay.mix, 0, 0.6);
+    }
+  }
+  function padSettings(i) {
+    var p = state.pads[i];
+    var o = {
+      tune: p.tune, level: p.level, muted: p.muted,
+      filterType: p.filterType, filterFreq: p.filterFreq, filterQ: p.filterQ,
+      voiceMode: p.voiceMode, choke: p.choke,
+      delay: { on: p.delay.on, time: p.delay.time, feedback: p.delay.feedback, mix: p.delay.mix },
+      custom: null,
+    };
+    if (p.customName && p.dataClean) o.custom = { name: p.customName, pcm: f32ToPcm16B64(p.dataClean) };
+    return o;
+  }
   function save() {
     try {
       localStorage.setItem("sp1200", JSON.stringify({
         bpm: state.bpm, swing: state.swing, master: state.master, spMode: state.spMode,
         pattern: state.pattern,
-        pads: state.pads.map(function (p) { return {
-          tune: p.tune, level: p.level, muted: p.muted,
-          filterType: p.filterType, filterFreq: p.filterFreq, filterQ: p.filterQ,
-          voiceMode: p.voiceMode, choke: p.choke,
-          delay: { on: p.delay.on, time: p.delay.time, feedback: p.delay.feedback, mix: p.delay.mix },
-        }; }),
+        pads: state.pads.map(function (p, i) { return padSettings(i); }),
       }));
     } catch (e) { /* private mode etc. */ }
   }
@@ -105,29 +202,8 @@
     try {
       var s = JSON.parse(localStorage.getItem("sp1200") || "null");
       if (!s) return;
-      if (s.bpm) state.bpm = clamp(s.bpm, 60, 200);
-      if (s.swing) state.swing = clamp(s.swing, 50, 75);
-      if (typeof s.master === "number") state.master = clamp(s.master, 0, 100);
-      if (typeof s.spMode === "boolean") state.spMode = s.spMode;
-      if (Array.isArray(s.pattern) && s.pattern.length === PAD_DEFS.length) state.pattern = s.pattern;
-      (s.pads || []).forEach(function (ps, i) {
-        if (!state.pads[i] || !ps) return;
-        state.pads[i].tune = clamp(ps.tune || 1, 0.5, 2);
-        state.pads[i].level = clamp(ps.level == null ? 0.9 : ps.level, 0, 1);
-        state.pads[i].muted = !!ps.muted;
-        if (ps.filterType && FILTER_TYPES.indexOf(ps.filterType) >= 0) state.pads[i].filterType = ps.filterType;
-        if (typeof ps.filterFreq === "number") state.pads[i].filterFreq = clamp(ps.filterFreq, FREQ_MIN, FREQ_MAX);
-        if (typeof ps.filterQ === "number") state.pads[i].filterQ = clamp(ps.filterQ, 0.5, 8);
-        if (ps.voiceMode === "mono" || ps.voiceMode === "poly") state.pads[i].voiceMode = ps.voiceMode;
-        if (typeof ps.choke === "number") state.pads[i].choke = clamp(Math.round(ps.choke), 0, 3);
-        if (ps.delay) {
-          var d = state.pads[i].delay;
-          d.on = !!ps.delay.on;
-          if (typeof ps.delay.time === "number") d.time = clamp(ps.delay.time, 0.03, 1);
-          if (typeof ps.delay.feedback === "number") d.feedback = clamp(ps.delay.feedback, 0, 0.85);
-          if (typeof ps.delay.mix === "number") d.mix = clamp(ps.delay.mix, 0, 0.6);
-        }
-      });
+      applyScalars(s);
+      (s.pads || []).forEach(function (ps, i) { applyPadSettings(i, ps); });
     } catch (e) { /* corrupted save */ }
   }
 
@@ -493,6 +569,166 @@
     slicerSetTape(t.buffer.getChannelData(0), t.name);
   }
 
+  // ---------------- projects: named save / load ----------------
+  var PROJECTS_KEY = "sp1200.projects";
+  function loadProjectIndex() {
+    try { return JSON.parse(localStorage.getItem(PROJECTS_KEY) || "{}") || {}; }
+    catch (e) { return {}; }
+  }
+  function writeProjectIndex(idx) {
+    localStorage.setItem(PROJECTS_KEY, JSON.stringify(idx));
+  }
+  function tapeToSaved(t) {
+    var o = { name: t.name, bars: t.bars, bpm: t.bpm, level: t.level, muted: t.muted, audio: null };
+    if (t.buffer && t.buffer.length) {
+      var len = t.buffer.length;
+      var l = t.buffer.getChannelData(0);
+      var r = (t.buffer.numberOfChannels || 1) > 1 ? t.buffer.getChannelData(1) : l;
+      var planar = new Float32Array(len * 2);
+      for (var i = 0; i < len; i++) { planar[i] = l[i]; planar[len + i] = r[i]; }
+      o.audio = { sr: t.buffer.sampleRate, len: len, pcm: f32ToPcm16B64(planar) };
+    }
+    return o;
+  }
+  function audioBufferFromSaved(a) {
+    ensureAudio();
+    var f = pcm16B64ToF32(a.pcm);
+    var buf = ctx.createBuffer(2, a.len, a.sr);
+    buf.getChannelData(0).set(f.subarray(0, a.len));
+    if (buf.numberOfChannels > 1) buf.getChannelData(1).set(f.subarray(a.len, a.len * 2));
+    return buf;
+  }
+  function serializeProject(name) {
+    return {
+      version: 1, name: name, savedAt: Date.now(),
+      bpm: state.bpm, swing: state.swing, master: state.master, spMode: state.spMode,
+      pattern: state.pattern.map(function (row) { return row.slice(); }),
+      pads: state.pads.map(function (p, i) { return padSettings(i); }),
+      tapes: state.tapes.map(tapeToSaved),
+      tapeBars: ui.tapeBars || 2,
+    };
+  }
+  function saveProject(name) {
+    name = (name || "").trim().slice(0, 40);
+    if (!name) { projStatus("Name the project first"); return; }
+    var idx = loadProjectIndex();
+    var proj = serializeProject(name);
+    try {
+      idx[name] = proj;
+      writeProjectIndex(idx);
+      projStatus("Saved \u201c" + name + "\u201d");
+    } catch (e) {
+      // quota: retry without tape audio, which dominates the size
+      try {
+        proj.tapes.forEach(function (t) { t.audio = null; });
+        proj.tapesDropped = true;
+        idx[name] = proj;
+        writeProjectIndex(idx);
+        projStatus("Saved \u201c" + name + "\u201d (tape audio too large \u2014 skipped)");
+      } catch (e2) { projStatus("Save failed: storage is full"); }
+    }
+    paintProjects();
+  }
+  function loadProject(name) {
+    var proj = loadProjectIndex()[name];
+    if (!proj || proj.version !== 1) { projStatus("Can't load \u201c" + name + "\u201d"); return; }
+    panic();
+    applyScalars(proj);
+    (proj.pads || []).forEach(function (ps, i) {
+      applyPadSettings(i, ps);
+      var p = state.pads[i];
+      if (!p) return;
+      if (ps && ps.custom && ps.custom.pcm) {
+        try {
+          p.dataClean = pcm16B64ToF32(ps.custom.pcm);
+          refreshSample(i);
+          p.customName = ps.custom.name || "SAMPLE";
+        } catch (e) { resetPad(i); }
+      } else {
+        p.dataSP = DSP.SYNTHS[p.def.id]();
+        p.dataClean = DSP.SYNTHS_RAW[p.def.id]();
+        p.customName = null;
+      }
+      p._undo = null; p.selStart = 0; p.selEnd = 1;
+    });
+    for (var ti = 0; ti < TAPE_COUNT; ti++) {
+      tapeStop(ti);
+      var t = state.tapes[ti], ts = (proj.tapes || [])[ti] || {};
+      t.buffer = null; t.bouncing = false; t.bounceError = false;
+      t.name = ts.name || ("TRACK " + (ti + 1));
+      t.bars = ts.bars || 2; t.bpm = ts.bpm || state.bpm;
+      t.level = typeof ts.level === "number" ? clamp(ts.level, 0, 1) : 0.8;
+      t.muted = !!ts.muted;
+      if (ts.audio && ts.audio.pcm && ts.audio.len) {
+        try { t.buffer = audioBufferFromSaved(ts.audio); }
+        catch (e) { t.buffer = null; }
+      }
+    }
+    ui.tapeBars = proj.tapeBars || 2;
+    syncUIFromState();
+    save(); // the autosave follows the loaded project
+    closeProjPanel();
+  }
+  function deleteProject(name) {
+    var idx = loadProjectIndex();
+    delete idx[name];
+    try { writeProjectIndex(idx); } catch (e) {}
+    paintProjects();
+    projStatus("Deleted \u201c" + name + "\u201d");
+  }
+  function newProject() {
+    if (!window.confirm("Start a new project? Unsaved changes will be lost.")) return;
+    try { localStorage.removeItem("sp1200"); } catch (e) {}
+    window.location.reload();
+  }
+  function projStatus(msg) {
+    if (ui.projStatus) ui.projStatus.textContent = msg || "";
+  }
+  function toggleProjPanel() {
+    if (!ui.projPanel) return;
+    var open = ui.projPanel.style.display !== "none";
+    if (open) closeProjPanel();
+    else {
+      ui.projPanel.style.display = "flex";
+      paintProjects();
+      projStatus("");
+      if (ui.projName && ui.projName.focus) ui.projName.focus();
+    }
+  }
+  function closeProjPanel() {
+    if (ui.projPanel) ui.projPanel.style.display = "none";
+  }
+  function paintProjects() {
+    if (!ui.projList) return;
+    var idx = loadProjectIndex();
+    var names = Object.keys(idx).sort();
+    ui.projList.innerHTML = "";
+    if (!names.length) {
+      var empty = el("div", "proj-empty", ui.projList);
+      empty.textContent = "NO SAVED PROJECTS";
+      return;
+    }
+    names.forEach(function (name) {
+      var item = el("div", "proj-item", ui.projList);
+      var nm = el("div", "nm", item);
+      nm.textContent = name;
+      nm.title = name;
+      var dt = el("div", "dt", item);
+      var when = idx[name] && idx[name].savedAt;
+      dt.textContent = when ? new Date(when).toLocaleDateString() : "";
+      var loadB = el("button", "btn", item);
+      loadB.textContent = "LOAD";
+      loadB.setAttribute("aria-label", "Load project " + name);
+      loadB.addEventListener("click", function () { loadProject(name); });
+      var delB = el("button", "btn", item);
+      delB.textContent = "DEL";
+      delB.setAttribute("aria-label", "Delete project " + name);
+      delB.addEventListener("click", function () {
+        if (window.confirm("Delete project \u201c" + name + "\u201d?")) deleteProject(name);
+      });
+    });
+  }
+
   // ---------------- custom samples ----------------
   function loadSampleFile(padIdx, file) {
     ensureAudio();
@@ -752,6 +988,7 @@
     drawWave();
   }
   function openEditor(i) {
+    closeProjPanel();
     if (!ed) buildEditor();
     ui.edOpenFor = i;
     var p = state.pads[i];
@@ -944,6 +1181,7 @@
   }
 
   function openSlicer() {
+    closeProjPanel();
     if (!sl) buildSlicer();
     syncSlicer();
     sl.root.style.display = "flex";
@@ -1024,6 +1262,7 @@
   }
 
   function openTape() {
+    closeProjPanel();
     if (!tp) buildTape();
     tp.root.style.display = "flex";
     paintTape();
@@ -1036,6 +1275,11 @@
   function tapeDurStr(t) {
     if (!t.buffer) return "";
     var sec = t.buffer.duration;
+    if (typeof sec !== "number") {
+      var ch0 = null;
+      try { ch0 = t.buffer.getChannelData(0); } catch (e) {}
+      sec = ch0 ? ch0.length / (t.buffer.sampleRate || 44100) : 0;
+    }
     return t.bars + (t.bars === 1 ? " bar" : " bars") + " \u00b7 " + t.bpm + " BPM \u00b7 " + sec.toFixed(1) + "s";
   }
 
@@ -1417,6 +1661,40 @@
     ui.tapeBtn.setAttribute("aria-label", "Open the tape arranger");
     ui.tapeBtn.addEventListener("click", openTape);
 
+    ui.projBtn = el("button", "btn", transport);
+    ui.projBtn.textContent = "PROJECT";
+    ui.projBtn.title = "Save / load named projects";
+    ui.projBtn.setAttribute("aria-label", "Open project save and load");
+    ui.projBtn.addEventListener("click", toggleProjPanel);
+
+    ui.projPanel = el("div", "proj-panel", transport);
+    ui.projPanel.style.display = "none";
+    ui.projPanel.setAttribute("role", "dialog");
+    ui.projPanel.setAttribute("aria-label", "Project save and load");
+    var prow = el("div", "proj-row", ui.projPanel);
+    ui.projName = el("input", "proj-name", prow);
+    ui.projName.placeholder = "PROJECT NAME";
+    ui.projName.maxLength = 40;
+    ui.projName.setAttribute("aria-label", "Project name");
+    ui.projName.addEventListener("keydown", function (e) {
+      if (e.code === "Enter" || e.key === "Enter") { saveProject(ui.projName.value); ui.projName.value = ""; }
+      else if (e.code === "Escape") { if (ui.projName.blur) ui.projName.blur(); closeProjPanel(); }
+      if (e.stopPropagation) e.stopPropagation();
+    });
+    var saveB = el("button", "btn", prow);
+    saveB.textContent = "SAVE";
+    saveB.setAttribute("aria-label", "Save project under this name");
+    saveB.addEventListener("click", function () { saveProject(ui.projName.value); ui.projName.value = ""; });
+    ui.projStatus = el("div", "proj-status", ui.projPanel);
+    ui.projStatus.setAttribute("aria-live", "polite");
+    ui.projList = el("div", "proj-list", ui.projPanel);
+    var nrow = el("div", "proj-row", ui.projPanel);
+    var newB = el("button", "btn", nrow);
+    newB.textContent = "NEW";
+    newB.title = "Clear everything and start a fresh project";
+    newB.setAttribute("aria-label", "Start a new project");
+    newB.addEventListener("click", newProject);
+
     var spec = el("div", "spec", transport);
     spec.innerHTML = "<b>26.04 kHz</b> · <b>12-BIT</b><br>VARISPEED TUNING";
 
@@ -1559,12 +1837,12 @@
     });
 
     var foot = el("div", "foot", app);
-    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; LOAD puts your own samples through the 12-bit path &nbsp;·&nbsp; SLICE chops a long sample across the pads &nbsp;·&nbsp; MONO / CHK voice modes per strip &nbsp;·&nbsp; delay lives in EDIT &nbsp;·&nbsp; TAPE bounces the pattern to a 4-track loop &nbsp;·&nbsp; play runs drums + tape together &nbsp;·&nbsp; PANIC kills all sound";
+    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; LOAD puts your own samples through the 12-bit path &nbsp;·&nbsp; SLICE chops a long sample across the pads &nbsp;·&nbsp; MONO / CHK voice modes per strip &nbsp;·&nbsp; delay lives in EDIT &nbsp;·&nbsp; TAPE bounces the pattern to a 4-track loop &nbsp;·&nbsp; play runs drums + tape together &nbsp;·&nbsp; PANIC kills all sound &nbsp;·&nbsp; PROJECT saves / loads named projects";
 
     // ---- keyboard ----
     document.addEventListener("keydown", function (e) {
       if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
-      if (e.code === "Escape") { closeEditor(); closeSlicer(); closeTape(); return; }
+      if (e.code === "Escape") { closeEditor(); closeSlicer(); closeTape(); closeProjPanel(); return; }
       if (e.code === "Space") {
         e.preventDefault();
         if (state.playing || anyTapePlaying()) globalStop(); else globalPlay();
@@ -1586,6 +1864,29 @@
     ui.tempo.set(state.bpm);
     ui.swing.set(state.swing);
     save();
+  }
+
+  // Push the whole state into every control: transport, strips, grid, tapes.
+  function syncUIFromState() {
+    ui.tempo.set(state.bpm);
+    ui.swing.set(state.swing);
+    ui.master.set(state.master);
+    ui.spBtn.classList.toggle("on", state.spMode);
+    state.pads.forEach(function (p, i) {
+      ui["padTune" + i].set(p.tune * 100);
+      ui["padLevel" + i].set(p.level * 100);
+      ui["padMute" + i].classList.toggle("on", p.muted);
+      setFilterType(i, p.filterType);
+      paintVoiceMode(i);
+      paintChoke(i);
+      ui.padNames[i].textContent = p.customName || p.def.name;
+      ui.padCards[i].classList.toggle("muted", p.muted);
+      ui.seqRows[i].classList.toggle("muted", p.muted);
+      ui.seqMutes[i].classList.toggle("on", p.muted);
+      for (var s = 0; s < STEPS; s++) ui.stepBtns[i][s].classList.toggle("on", !!state.pattern[i][s]);
+    });
+    paintTape();
+    for (var ti = 0; ti < TAPE_COUNT; ti++) drawTapeWave(ti);
   }
 
   function init() {
@@ -1610,25 +1911,7 @@
     var any = state.pattern.some(function (row) { return row.some(Boolean); });
     buildUI();
     if (!any) applyPreset("Boom Bap");
-    else {
-      // reflect loaded state in the freshly built UI
-      ui.tempo.set(state.bpm);
-      ui.swing.set(state.swing);
-      ui.master.set(state.master);
-      ui.spBtn.classList.toggle("on", state.spMode);
-      state.pads.forEach(function (p, i) {
-        ui["padTune" + i].set(p.tune * 100);
-        ui["padLevel" + i].set(p.level * 100);
-        ui["padMute" + i].classList.toggle("on", p.muted);
-        setFilterType(i, p.filterType);
-        paintVoiceMode(i);
-        paintChoke(i);
-        ui.padCards[i].classList.toggle("muted", p.muted);
-        ui.seqRows[i].classList.toggle("muted", p.muted);
-        ui.seqMutes[i].classList.toggle("on", p.muted);
-        for (var s = 0; s < STEPS; s++) ui.stepBtns[i][s].classList.toggle("on", !!state.pattern[i][s]);
-      });
-    }
+    else syncUIFromState(); // reflect loaded state in the freshly built UI
   }
 
   // expose for tests
@@ -1649,7 +1932,11 @@
     _tapePlay: tapePlay, _tapeStop: tapeStop, _tapePlayAll: tapePlayAll, _tapeStopAll: tapeStopAll,
     _tapeToSlicer: tapeToSlicer,
     _globalPlay: globalPlay, _globalStop: globalStop, _panic: panic,
-    _anyTapePlaying: anyTapePlaying, _paintTransport: paintTransport };
+    _anyTapePlaying: anyTapePlaying, _paintTransport: paintTransport,
+    _saveProject: saveProject, _loadProject: loadProject, _deleteProject: deleteProject,
+    _listProjects: loadProjectIndex, _paintProjects: paintProjects,
+    _serializeProject: serializeProject, _syncUI: syncUIFromState,
+    _f32ToPcm16B64: f32ToPcm16B64, _pcm16B64ToF32: pcm16B64ToF32 };
   if (typeof window !== "undefined") window.SP1200 = api;
   else globalThis.SP1200 = api;
 
