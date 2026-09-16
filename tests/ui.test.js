@@ -338,6 +338,39 @@ ok(p2.dataClean.length !== before, "pad sample replaced by the segment");
 ok(Object.prototype.toString.call(p2.dataSP) === "[object Float32Array]" && p2.dataSP.length > 0, "12-bit SP buffer re-derived for the chop");
 ok(p2._undo && p2._undo.length === 1, "chop load is undoable in the editor");
 
+// TRIM tightens the selected segment to the audio
+SP._slicerSetTape(burstTape(SR, [0.25, 0.75, 1.25, 1.75]), "trimtest");
+sl = SP._slicer();
+sl.nInput.value = 4;
+SP._slicerEqual();
+SP._auditionSegment(1);  // 0.5–1.0s, hit lands at 0.75s
+const trimBefore = SP._slicerSegments()[1];
+SP._slicerTrim();
+const trimAfter = SP._slicerSegments()[1];
+ok(trimAfter.start > trimBefore.start, "TRIM moves the segment start in to the audio");
+ok(trimAfter.end < trimBefore.end, "TRIM moves the segment end in to the audio");
+ok(Math.abs(trimAfter.start / SR - 0.75) < 0.02, "trimmed start sits right on the hit");
+
+// UNDO restores the pre-trim tape
+SP._slicerUndo();
+const trimRestored = SP._slicerSegments()[1];
+ok(trimRestored.start === trimBefore.start && trimRestored.end === trimBefore.end, "UNDO restores the pre-trim markers");
+
+// CROP keeps only the selected segment
+SP._slicerCrop();
+ok(sl.tape.length === trimBefore.end - trimBefore.start, "CROP makes the tape the selected segment");
+ok(SP._slicerSegments().length === 1, "cropped tape is a single segment");
+SP._slicerUndo();
+ok(sl.tape.length === SR * 2, "UNDO restores the full tape after crop");
+
+// PANIC in the slicer stops the audition
+ok(sl.panicBtn && sl.panicBtn.textContent === "PANIC", "slicer has a PANIC button");
+ok(sl.panicBtn.classList.contains("panic"), "slicer PANIC uses the panic styling");
+SP._auditionSegment(0);
+const slicerAud = ac().lastSource;
+sl.panicBtn.click();
+ok(slicerAud.stopped, "slicer PANIC stops the ringing audition");
+
 SP._closeSlicer();
 ok(SP._slicer().root.style.display === "none", "slicer closes");
 SP._openSlicer();

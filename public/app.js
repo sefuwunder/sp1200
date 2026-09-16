@@ -402,6 +402,7 @@
     var t = ctx.currentTime;
     stopTransport();
     tapeStopAll();
+    stopSlicerAudition();
     var VS = liveVS();
     for (var i = 0; i < state.pads.length; i++) {
       killStoreVoices(VS[i], t);
@@ -1157,8 +1158,14 @@
     opBtn("EQUAL", slicerEqual, "Chop the tape into N equal slices");
     opBtn("AUTO", slicerAuto, "Detect transients and mark each hit");
     opBtn("CLEAR", function () {
+      pushTapeUndo();
       sl.markers = []; sl.selSeg = 0; syncSlicer();
     }, "Remove all slice markers");
+    var trimBtn = opBtn("TRIM", slicerTrim, "Tighten the selected segment to the audio — trims leading/trailing silence");
+    var cropBtn = opBtn("CROP", slicerCrop, "Keep only the selected segment: the tape becomes this chop");
+    var undoBtn = opBtn("UNDO", slicerUndo, "Undo the last trim, crop, or clear");
+    var panicBtn = opBtn("PANIC", panic, "Stop all sound immediately");
+    panicBtn.classList.add("panic");
 
     var chipsLab = el("div", "ed-flab", panel);
     chipsLab.textContent = "SEGMENTS — TAP TO HEAR";
@@ -1184,7 +1191,8 @@
       root: root, title: title, canvas: cv, info: info, chips: chips,
       nInput: nInput, fileInput: fileInput, padBtns: padBtns,
       tape: null, tapeName: "", markers: [], selSeg: 0, chipBtns: [],
-      dragIdx: -1,
+      dragIdx: -1, auditionSrc: null, tapeUndo: [],
+      trimBtn: trimBtn, cropBtn: cropBtn, undoBtn: undoBtn, panicBtn: panicBtn,
     };
 
     // marker interactions on the waveform
@@ -1514,6 +1522,71 @@
     src.start();
   }
 
+  function stopSlicerAudition() {
+    if (sl && sl.auditionSrc) {
+      try { sl.auditionSrc.stop(); } catch (e) {}
+      sl.auditionSrc = null;
+    }
+  }
+
+  // Destructive tape ops (trim/crop/clear) push the pre-op state here.
+  function pushTapeUndo() {
+    if (!sl || !sl.tape) return;
+    sl.tapeUndo.push({
+      tape: sl.tape.slice(), markers: sl.markers.slice(),
+      tapeName: sl.tapeName, selSeg: sl.selSeg,
+    });
+    if (sl.tapeUndo.length > 12) sl.tapeUndo.shift();
+  }
+  function slicerUndo() {
+    if (!sl || !sl.tapeUndo.length) return;
+    stopSlicerAudition();
+    var u = sl.tapeUndo.pop();
+    sl.tape = u.tape; sl.markers = u.markers; sl.tapeName = u.tapeName;
+    sl.selSeg = Math.min(u.selSeg, Math.max(0, slicerSegments().length - 1));
+    syncSlicer();
+  }
+
+  function slicerTrim() {
+    // Tighten the selected segment: move its bounding markers inward to the
+    // first/last sample above the silence threshold. Tape edges have no
+    // marker, so they stay put.
+    var segs = slicerSegments();
+    var i = Math.min(sl.selSeg, segs.length - 1);
+    if (!sl || !sl.tape || !segs[i]) return;
+    var d = sl.tape, n = d.length, seg = segs[i], TH = 0.02, MINLEN = 64;
+    var s = seg.start, e = seg.end;
+    while (s < e - MINLEN && Math.abs(d[s]) < TH) s++;
+    while (e > s + MINLEN && Math.abs(d[e - 1]) < TH) e--;
+    if (s === seg.start && e === seg.end) {
+      updateSlicerInfo();
+      sl.info.textContent += " · already tight, nothing to trim";
+      return;
+    }
+    pushTapeUndo();
+    var eps = 2 / n, f0 = seg.start / n, f1 = seg.end / n;
+    for (var k = 0; k < sl.markers.length; k++) {
+      if (Math.abs(sl.markers[k] - f0) < eps) sl.markers[k] = s / n;
+      else if (Math.abs(sl.markers[k] - f1) < eps) sl.markers[k] = e / n;
+    }
+    sl.selSeg = i;
+    stopSlicerAudition();
+    syncSlicer();
+  }
+
+  function slicerCrop() {
+    // The tape becomes the selected segment; everything else is discarded.
+    var segs = slicerSegments();
+    var i = Math.min(sl.selSeg, segs.length - 1);
+    if (!sl || !sl.tape || !segs[i]) return;
+    pushTapeUndo();
+    sl.tape = sl.tape.slice(segs[i].start, segs[i].end);
+    sl.markers = [];
+    sl.selSeg = 0;
+    stopSlicerAudition();
+    syncSlicer();
+  }
+
   function sliceToPad(padIdx) {
     var segs = slicerSegments();
     if (!segs.length || !sl.tape) return;
@@ -1583,6 +1656,8 @@
     sl.tapeName = String(name || "tape").replace(/\.\w+$/, "").slice(0, 18).toUpperCase();
     sl.markers = [];
     sl.selSeg = 0;
+    sl.tapeUndo = [];
+    sl.auditionSrc = null;
     syncSlicer();
   }
 
@@ -2004,6 +2079,7 @@
     _openSlicer: openSlicer, _closeSlicer: closeSlicer,
     _slicerSetTape: slicerSetTape, _slicerEqual: slicerEqual, _slicerAuto: slicerAuto,
     _slicerSegments: slicerSegments, _auditionSegment: auditionSegment, _sliceToPad: sliceToPad,
+    _slicerTrim: slicerTrim, _slicerCrop: slicerCrop, _slicerUndo: slicerUndo,
     _slicer: function () { return sl; },
     _editor: function () { return ed; }, _paintChoke: paintChoke, _paintVoiceMode: paintVoiceMode,
     _openTape: openTape, _closeTape: closeTape, _tape: function () { return tp; },
