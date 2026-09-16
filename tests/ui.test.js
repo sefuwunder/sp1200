@@ -82,18 +82,36 @@ FakeAC.prototype.createBuffer = function (ch, len, rate) {
   };
   return b;
 };
+function makeParam() {
+  return {
+    value: 0,
+    setTargetAtTime: function (v) { this.value = v; },
+    setValueAtTime: function (v) { this.value = v; },
+    cancelScheduledValues: function () {},
+  };
+}
 FakeAC.prototype.createBufferSource = function () {
   const s = makeNode();
   s.buffer = null;
   s.playbackRate = { value: 1 };
   s.start = function () {};
+  s.stop = function (t) { this.stopped = true; this.stopAt = t; };
+  s.stopped = false;
+  s.onended = null;
   this.lastSource = s;
   return s;
 };
 FakeAC.prototype.createGain = function () {
   const g = makeNode();
-  g.gain = { value: 1 };
+  g.gain = makeParam();
   return g;
+};
+FakeAC.prototype.createDelay = function (max) {
+  const d = makeNode();
+  d.delayTime = makeParam();
+  d.maxDelayTime = max || 1;
+  this.lastDelay = d;
+  return d;
 };
 FakeAC.prototype.createBiquadFilter = function () {
   const f = makeNode();
@@ -269,5 +287,73 @@ SP._openSlicer();
 listeners.keydown({ code: "Escape", target: {} });
 ok(SP._slicer().root.style.display === "none", "Escape closes the slicer");
 
+
+// ---- voice modes: choke groups + mono/poly ----
+SP.state.pads.forEach(function (p) { p._voices = []; });  // clear voices from earlier tests
+ok(SP.state.pads[4].choke === 1 && SP.state.pads[5].choke === 1, "HAT and OPEN HAT ship in choke group A");
+ok(SP.state.pads[0].choke === 0, "other pads ship with no choke group");
+ok(ui.padChoke4.textContent === "CHK A", "choke strip button labels the default group");
+ok(ui.padMode0.textContent === "POLY", "voice mode button shows POLY by default");
+
+SP._playPad(5);  // open hat ringing
+const ohatSrc = ac().lastSource;
+ok(SP.state.pads[5]._voices.length === 1, "open hat voice is tracked");
+SP._playPad(4);  // closed hat chokes it
+ok(ohatSrc.stopped, "closed hat hit stops the open hat voice (choke group A)");
+ok(SP.state.pads[5]._voices.length === 0, "choked pad voice list is cleared");
+ok(SP.state.pads[4]._voices.length === 1, "choking pad keeps its own voice");
+
+ui.padMode0.click();  // kick -> mono
+ok(SP.state.pads[0].voiceMode === "mono", "MODE button switches the kick to mono");
+ok(ui.padMode0.textContent === "MONO", "MODE button labels MONO");
+SP._playPad(0);
+const kickSrc1 = ac().lastSource;
+SP._playPad(0);
+ok(kickSrc1.stopped, "second hit in mono kills the first voice");
+ok(SP.state.pads[0]._voices.length === 1, "mono keeps a single live voice");
+
+SP._playPad(1);  // snare stays poly
+const snareSrc1 = ac().lastSource;
+SP._playPad(1);
+ok(!snareSrc1.stopped, "poly pad lets voices overlap");
+ok(SP.state.pads[1]._voices.length === 2, "poly tracks both live voices");
+
+ui.padChoke0.click();
+ok(SP.state.pads[0].choke === 1 && ui.padChoke0.textContent === "CHK A", "CHOKE cycles to group A");
+ui.padChoke0.click(); ui.padChoke0.click();
+ok(SP.state.pads[0].choke === 3 && ui.padChoke0.textContent === "CHK C", "CHOKE cycles to group C");
+ui.padChoke0.click();
+ok(SP.state.pads[0].choke === 0 && ui.padChoke0.textContent === "CHK OFF", "CHOKE wraps back to off");
+
+// ---- per-pad delay ----
+ok(!SP.state.pads[2]._delay, "no delay nodes before the effect is ever enabled");
+SP._openEditor(2);
+const ved = SP._editor();
+ok(ved.dOn.textContent === "OFF", "delay toggle ships off");
+ved.dOn.click();
+ok(SP.state.pads[2].delay.on, "delay toggle enables the effect");
+ok(ved.dOn.textContent === "ON", "delay toggle labels ON");
+ok(SP.state.pads[2]._delay, "enabling delay creates the per-pad nodes");
+const vdl = SP.state.pads[2]._delay;
+ok(Math.abs(vdl.node.delayTime.value - 0.32) < 1e-9, "delay time synced from pad settings");
+ok(Math.abs(vdl.fb.gain.value - 0.35) < 1e-9, "delay feedback synced from pad settings");
+ok(Math.abs(vdl.wet.gain.value - 0.3) < 1e-9, "delay mix synced from pad settings");
+SP._playPad(2);
+ok(SP.state.pads[2]._delay === vdl, "delay nodes are reused across hits");
+ved.dTime.input.value = "50";
+ved.dTime.input._handlers.input[0]();
+ok(Math.abs(SP.state.pads[2].delay.time - 0.5) < 1e-9, "TIME slider sets delay time");
+ok(Math.abs(vdl.node.delayTime.value - 0.5) < 1e-9, "delay time re-syncs live");
+ved.dOn.click();
+ok(!SP.state.pads[2].delay.on && ved.dOn.textContent === "OFF", "delay toggle disables the effect");
+ok(Math.abs(vdl.wet.gain.value - 0) < 1e-9, "wet gain drops to zero when delay is off");
+SP._closeEditor();
+
+// ---- voice + delay persist ----
+const vsaved = JSON.parse(sandbox.localStorage.getItem("sp1200"));
+ok(vsaved.pads[0].voiceMode === "mono", "mono mode persists to localStorage");
+ok(vsaved.pads[4].choke === 1, "choke group persists to localStorage");
+ok(vsaved.pads[2].delay.on === false, "delay disable persists to localStorage");
+ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to localStorage");
 
 console.log("\nui: " + n + " passed");

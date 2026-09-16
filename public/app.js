@@ -94,6 +94,8 @@
         pads: state.pads.map(function (p) { return {
           tune: p.tune, level: p.level, muted: p.muted,
           filterType: p.filterType, filterFreq: p.filterFreq, filterQ: p.filterQ,
+          voiceMode: p.voiceMode, choke: p.choke,
+          delay: { on: p.delay.on, time: p.delay.time, feedback: p.delay.feedback, mix: p.delay.mix },
         }; }),
       }));
     } catch (e) { /* private mode etc. */ }
@@ -115,6 +117,15 @@
         if (ps.filterType && FILTER_TYPES.indexOf(ps.filterType) >= 0) state.pads[i].filterType = ps.filterType;
         if (typeof ps.filterFreq === "number") state.pads[i].filterFreq = clamp(ps.filterFreq, FREQ_MIN, FREQ_MAX);
         if (typeof ps.filterQ === "number") state.pads[i].filterQ = clamp(ps.filterQ, 0.5, 8);
+        if (ps.voiceMode === "mono" || ps.voiceMode === "poly") state.pads[i].voiceMode = ps.voiceMode;
+        if (typeof ps.choke === "number") state.pads[i].choke = clamp(Math.round(ps.choke), 0, 3);
+        if (ps.delay) {
+          var d = state.pads[i].delay;
+          d.on = !!ps.delay.on;
+          if (typeof ps.delay.time === "number") d.time = clamp(ps.delay.time, 0.03, 1);
+          if (typeof ps.delay.feedback === "number") d.feedback = clamp(ps.delay.feedback, 0, 0.85);
+          if (typeof ps.delay.mix === "number") d.mix = clamp(ps.delay.mix, 0, 0.6);
+        }
       });
     } catch (e) { /* corrupted save */ }
   }
@@ -138,10 +149,65 @@
   }
 
   // Trigger a pad. `when` is an AudioContext time; omit for "now".
+  // ---- voice management: choke groups + mono/poly ----
+  function stopVoice(v, t) {
+    try {
+      var g = v.gain.gain;
+      g.cancelScheduledValues(t);
+      g.setValueAtTime(g.value, t);
+      g.setTargetAtTime(0, t, 0.004);
+      v.src.stop(t + 0.08);
+    } catch (e) {
+      try { v.src.stop(); } catch (e2) {}
+    }
+  }
+
+  function killPadVoices(idx, t) {
+    var p = state.pads[idx];
+    var vs = p._voices || [];
+    p._voices = [];
+    for (var i = 0; i < vs.length; i++) stopVoice(vs[i], t);
+  }
+
+  // ---- per-pad delay effect (shared nodes, lazily created) ----
+  function padDelay(idx) {
+    var p = state.pads[idx];
+    if (!p._delay) {
+      var d = ctx.createDelay(1.0);
+      var fb = ctx.createGain();
+      var wet = ctx.createGain();
+      wet.gain.value = 0;
+      d.connect(fb);
+      fb.connect(d);
+      d.connect(wet);
+      wet.connect(masterGain);
+      p._delay = { node: d, fb: fb, wet: wet };
+    }
+    return p._delay;
+  }
+
+  function syncDelay(idx) {
+    var p = state.pads[idx];
+    if (!p._delay || !ctx) return;
+    var t = ctx.currentTime;
+    p._delay.node.delayTime.setTargetAtTime(clamp(p.delay.time, 0.03, 1), t, 0.02);
+    p._delay.fb.gain.setTargetAtTime(clamp(p.delay.feedback, 0, 0.85), t, 0.02);
+    p._delay.wet.gain.setTargetAtTime(p.delay.on ? clamp(p.delay.mix, 0, 0.6) : 0, t, 0.02);
+  }
+
   function playPad(idx, when) {
     var p = state.pads[idx];
     if (!p || p.muted) return;
     ensureAudio();
+    var t0 = when == null ? ctx.currentTime : when;
+    // Choke groups: a hit cuts every other pad sharing its group.
+    if (p.choke) {
+      for (var c = 0; c < state.pads.length; c++) {
+        if (c !== idx && state.pads[c].choke === p.choke) killPadVoices(c, t0);
+      }
+    }
+    // Mono: retriggering cuts this pad's own tail.
+    if (p.voiceMode === "mono") killPadVoices(idx, t0);
     var useSP = state.spMode;
     var data = useSP ? p.dataSP : p.dataClean;
     var rate = useSP ? DSP.SP_RATE : DSP.SYNTH_RATE;
@@ -163,7 +229,19 @@
       src.connect(g);
     }
     g.connect(masterGain);
-    src.start(when == null ? 0 : when);
+    if (p.delay.on) {
+      var dl = padDelay(idx);
+      syncDelay(idx);
+      g.connect(dl.node);
+    }
+    var voice = { src: src, gain: g };
+    p._voices = p._voices || [];
+    p._voices.push(voice);
+    src.onended = function () {
+      var a = p._voices.indexOf(voice);
+      if (a >= 0) p._voices.splice(a, 1);
+    };
+    src.start(t0);
     flashPad(idx);
   }
 
@@ -270,6 +348,20 @@
     var p = state.pads[i];
     setFilterType(i, FILTER_TYPES[(FILTER_TYPES.indexOf(p.filterType) + 1) % FILTER_TYPES.length]);
     save();
+  }
+
+  var CHOKE_NAMES = ["CHK OFF", "CHK A", "CHK B", "CHK C"];
+  function paintVoiceMode(i) {
+    var p = state.pads[i], b = ui["padMode" + i];
+    if (!p || !b) return;
+    b.textContent = p.voiceMode === "mono" ? "MONO" : "POLY";
+    b.classList.toggle("on", p.voiceMode === "mono");
+  }
+  function paintChoke(i) {
+    var p = state.pads[i], b = ui["padChoke" + i];
+    if (!p || !b) return;
+    b.textContent = CHOKE_NAMES[clamp(p.choke | 0, 0, 3)];
+    b.classList.toggle("on", (p.choke | 0) > 0);
   }
 
   // Re-derive the 12-bit SP buffer from the edited clean sample.
@@ -402,7 +494,39 @@
       function (v) { return (v / 10).toFixed(1); },
       function (v) { state.pads[ui.edOpenFor].filterQ = v / 10; save(); });
 
-    ed = { root: root, title: title, canvas: cv, info: info, ftypeBtns: ftypeBtns, cutoff: cutoff, reso: reso };
+    var dsec = el("div", "ed-filter", panel);
+    var dlab = el("div", "ed-flab", dsec);
+    dlab.textContent = "DELAY";
+    var drow = el("div", "ed-ftypes", dsec);
+    var dOnBtn = el("button", "btn", drow);
+    dOnBtn.textContent = "OFF";
+    dOnBtn.setAttribute("aria-label", "Toggle delay effect");
+    dOnBtn.addEventListener("click", function () {
+      var i = ui.edOpenFor, p = state.pads[i];
+      p.delay.on = !p.delay.on;
+      if (p.delay.on && ctx) { padDelay(i); syncDelay(i); }
+      else if (ctx) syncDelay(i);
+      paintDelay();
+      save();
+    });
+    var dTime = makeSlider(dsec, "TIME", 3, 100, 1, 32,
+      function (v) { return Math.round(v * 10) + " ms"; },
+      function (v) { var p = state.pads[ui.edOpenFor]; p.delay.time = v / 100; if (ctx) syncDelay(ui.edOpenFor); save(); });
+    var dFdbk = makeSlider(dsec, "FDBK", 0, 85, 1, 35,
+      function (v) { return Math.round(v) + "%"; },
+      function (v) { var p = state.pads[ui.edOpenFor]; p.delay.feedback = v / 100; if (ctx) syncDelay(ui.edOpenFor); save(); });
+    var dMix = makeSlider(dsec, "MIX", 0, 60, 1, 30,
+      function (v) { return Math.round(v) + "%"; },
+      function (v) { var p = state.pads[ui.edOpenFor]; p.delay.mix = v / 100; if (ctx) syncDelay(ui.edOpenFor); save(); });
+
+    ed = { root: root, title: title, canvas: cv, info: info, ftypeBtns: ftypeBtns, cutoff: cutoff, reso: reso,
+           dOn: dOnBtn, dTime: dTime, dFdbk: dFdbk, dMix: dMix };
+  }
+  function paintDelay() {
+    if (!ed) return;
+    var on = state.pads[ui.edOpenFor].delay.on;
+    ed.dOn.textContent = on ? "ON" : "OFF";
+    ed.dOn.classList.toggle("on", on);
   }
   function paintFilterTypes() {
     if (!ed) return;
@@ -417,6 +541,10 @@
     paintFilterTypes();
     ed.cutoff.set(freqToSlider(p.filterFreq));
     ed.reso.set(p.filterQ * 10);
+    paintDelay();
+    ed.dTime.set(p.delay.time * 100);
+    ed.dFdbk.set(p.delay.feedback * 100);
+    ed.dMix.set(p.delay.mix * 100);
     drawWave();
   }
   function openEditor(i) {
@@ -1002,10 +1130,29 @@
       var fltBtn = el("button", "btn", row2);
       fltBtn.setAttribute("aria-label", "Cycle filter type for " + def.name);
       fltBtn.addEventListener("click", function () { cycleFilter(i); });
+      var modeBtn = el("button", "btn", row2);
+      modeBtn.setAttribute("aria-label", "Toggle mono/poly voice mode for " + def.name);
+      modeBtn.addEventListener("click", function () {
+        var p = state.pads[i];
+        p.voiceMode = p.voiceMode === "mono" ? "poly" : "mono";
+        paintVoiceMode(i);
+        save();
+      });
+      var chokeBtn = el("button", "btn", row2);
+      chokeBtn.setAttribute("aria-label", "Cycle choke group for " + def.name);
+      chokeBtn.addEventListener("click", function () {
+        var p = state.pads[i];
+        p.choke = (p.choke + 1) % 4;  // off -> A -> B -> C -> off
+        paintChoke(i);
+        save();
+      });
 
       ui["padTune" + i] = tune; ui["padLevel" + i] = level; ui["padMute" + i] = muteBtn;
       ui["padEdit" + i] = editBtn; ui["padFlt" + i] = fltBtn;
+      ui["padMode" + i] = modeBtn; ui["padChoke" + i] = chokeBtn;
       setFilterType(i, state.pads[i].filterType);
+      paintVoiceMode(i);
+      paintChoke(i);
     });
 
     // ---- sequencer ----
@@ -1061,7 +1208,7 @@
     });
 
     var foot = el("div", "foot", app);
-    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; LOAD puts your own samples through the 12-bit path &nbsp;·&nbsp; SLICE chops a long sample across the pads";
+    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; LOAD puts your own samples through the 12-bit path &nbsp;·&nbsp; SLICE chops a long sample across the pads &nbsp;·&nbsp; MONO / CHK voice modes per strip &nbsp;·&nbsp; delay lives in EDIT";
 
     // ---- keyboard ----
     document.addEventListener("keydown", function (e) {
@@ -1099,7 +1246,10 @@
         dataClean: DSP.SYNTHS_RAW[def.id](),
         tune: 1, level: 0.9, muted: false, customName: null,
         filterType: "off", filterFreq: FREQ_MAX, filterQ: 0.8,
-        selStart: 0, selEnd: 1, _undo: null,
+        voiceMode: "poly",
+        choke: (def.id === "chat" || def.id === "ohat") ? 1 : 0,  // 0=off, 1..3 = groups A/B/C
+        delay: { on: false, time: 0.32, feedback: 0.35, mix: 0.3 },
+        selStart: 0, selEnd: 1, _undo: null, _voices: [], _delay: null,
       });
       state.pattern.push(new Array(STEPS).fill(0));
     });
@@ -1119,6 +1269,8 @@
         ui["padLevel" + i].set(p.level * 100);
         ui["padMute" + i].classList.toggle("on", p.muted);
         setFilterType(i, p.filterType);
+        paintVoiceMode(i);
+        paintChoke(i);
         ui.padCards[i].classList.toggle("muted", p.muted);
         ui.seqRows[i].classList.toggle("muted", p.muted);
         ui.seqMutes[i].classList.toggle("on", p.muted);
@@ -1138,7 +1290,8 @@
     _openSlicer: openSlicer, _closeSlicer: closeSlicer,
     _slicerSetTape: slicerSetTape, _slicerEqual: slicerEqual, _slicerAuto: slicerAuto,
     _slicerSegments: slicerSegments, _auditionSegment: auditionSegment, _sliceToPad: sliceToPad,
-    _slicer: function () { return sl; } };
+    _slicer: function () { return sl; },
+    _editor: function () { return ed; }, _paintChoke: paintChoke, _paintVoiceMode: paintVoiceMode };
   if (typeof window !== "undefined") window.SP1200 = api;
   else globalThis.SP1200 = api;
 
