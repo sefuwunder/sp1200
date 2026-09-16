@@ -259,6 +259,24 @@
     return { input: input, valEl: valEl, set: function (v) { input.value = v; valEl.textContent = fmt(v); } };
   }
 
+  // vertical channel fader (tall skinny mixer-style strip control)
+  function makeVFader(parent, label, min, max, step, val, cls, fmt, onInput) {
+    var fb = el("div", "fader", parent);
+    var valEl = el("b", "led", fb); valEl.textContent = fmt(val);
+    var input = el("input", "vf " + cls, fb);
+    input.type = "range"; input.min = min; input.max = max; input.step = step;
+    input.value = val;
+    input.setAttribute("orient", "vertical");
+    input.setAttribute("aria-label", label);
+    input.addEventListener("input", function () {
+      var v = parseFloat(input.value);
+      valEl.textContent = fmt(v);
+      onInput(v);
+    });
+    var flab = el("span", "flab", fb); flab.textContent = label;
+    return { input: input, valEl: valEl, set: function (v) { input.value = v; valEl.textContent = fmt(v); } };
+  }
+
   function buildUI() {
     var mount = (document.querySelector && document.querySelector(".chassis")) || document.body;
     var app = el("div", "", mount);
@@ -326,12 +344,12 @@
     spec.innerHTML = "<b>26.04 kHz</b> · <b>12-BIT</b><br>VARISPEED TUNING";
 
     // ---- pads ----
-    var pt = el("div", "section-title", app); pt.textContent = "PADS";
+    var pt = el("div", "section-title", app); pt.textContent = "PERFORMANCE";
     var padsEl = el("div", "pads", app);
     ui.padBtns = []; ui.padNames = []; ui.padCards = [];
 
     PAD_DEFS.forEach(function (def, i) {
-      var card = el("div", "pad-card", padsEl);
+      var card = el("div", "pad-card strip", padsEl);
       ui.padCards.push(card);
       var btn = el("button", "pad", card);
       ui.padBtns.push(btn);
@@ -341,11 +359,11 @@
       btn.setAttribute("aria-label", "Trigger " + def.name);
       btn.addEventListener("pointerdown", function (e) { e.preventDefault(); playPad(i); });
 
-      var tune = makeSlider(card, "TUNE", 50, 200, 1, 100,
+      var frow = el("div", "frow", card);
+      var tune = makeVFader(frow, "TUNE", 50, 200, 1, 100, "tune",
         function (v) { return Math.round(v) + "%"; },
         function (v) { state.pads[i].tune = v / 100; save(); });
-      tune.input.classList.add("mini-slider");
-      var level = makeSlider(card, "LEVEL", 0, 100, 1, 90,
+      var level = makeVFader(frow, "LEVEL", 0, 100, 1, 90, "level",
         function (v) { return Math.round(v) + "%"; },
         function (v) { state.pads[i].level = v / 100; save(); });
 
@@ -382,12 +400,13 @@
     });
 
     // ---- sequencer ----
-    var st = el("div", "section-title", app); st.textContent = "SEQUENCER";
+    var st = el("div", "section-title", app); st.textContent = "PROGRAMMING";
     var seq = el("div", "seq", app);
+    var screen = el("div", "screen", seq);
     ui.seqRows = []; ui.seqMutes = []; ui.stepBtns = [];
 
     PAD_DEFS.forEach(function (def, i) {
-      var row = el("div", "seq-row", seq);
+      var row = el("div", "seq-row", screen);
       ui.seqRows.push(row);
       var lab = el("div", "seq-label", row);
       var labName = el("span", "", lab); labName.textContent = def.name;
