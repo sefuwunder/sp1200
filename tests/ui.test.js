@@ -321,6 +321,13 @@ SP._auditionSegment(1);
 ok(ac().lastSource.buffer.sampleRate === 44100, "segment audition plays the clean 44.1 kHz buffer");
 ok(ac().lastSource.buffer._data.length === SP._slicerSegments()[1].end - SP._slicerSegments()[1].start, "auditioned buffer matches the segment");
 
+// single-audio preview: a new audition cuts off the previous one
+const firstAud = ac().lastSource;
+SP._auditionSegment(2);
+ok(firstAud.stopped, "auditioning a second segment stops the first (no clashing previews)");
+ok(ac().lastSource !== firstAud, "the new audition is the live source");
+SP._auditionSegment(1);  // restore the selection the chop-load test expects
+
 // load a segment onto a pad
 const before = SP.state.pads[2].dataClean.length;
 SP._sliceToPad(2);

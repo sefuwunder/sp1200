@@ -1498,10 +1498,14 @@
     drawSlicerWave();
     updateSlicerInfo();
     ensureAudio();
+    // single-audio preview: a new audition cuts off any still-ringing one
+    // so previewing slices never clashes with itself
+    if (sl.auditionSrc) { try { sl.auditionSrc.stop(); } catch (e) {} }
     var cut = sl.tape.slice(segs[i].start, segs[i].end);
     var buf = ctx.createBuffer(1, cut.length, DSP.SYNTH_RATE);
     buf.copyToChannel(cut, 0);
     var src = ctx.createBufferSource();
+    sl.auditionSrc = src;
     src.buffer = buf;
     var g = ctx.createGain();
     g.gain.value = 0.9;
