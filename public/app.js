@@ -260,7 +260,8 @@
   }
 
   function buildUI() {
-    var app = el("div", "", document.body);
+    var mount = (document.querySelector && document.querySelector(".chassis")) || document.body;
+    var app = el("div", "", mount);
     app.id = "app";
 
     // ---- transport ----
