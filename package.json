@@ -1,0 +1,1 @@
+{"name":"sp1200","private":true,"scripts":{"start":"bun src/server.ts","test":"node /tmp/sp1200-dsp-test.js && node /tmp/sp1200-ui-test.js"},"version":"1.0.0"}
