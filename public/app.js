@@ -632,6 +632,9 @@
   function loadProject(name) {
     var proj = loadProjectIndex()[name];
     if (!proj || proj.version !== 1) { projStatus("Can't load \u201c" + name + "\u201d"); return; }
+    loadProjectData(proj);
+  }
+  function loadProjectData(proj) {
     panic();
     applyScalars(proj);
     (proj.pads || []).forEach(function (ps, i) {
@@ -680,6 +683,58 @@
     if (!window.confirm("Start a new project? Unsaved changes will be lost.")) return;
     try { localStorage.removeItem("sp1200"); } catch (e) {}
     window.location.reload();
+  }
+  // ---------------- external save / load: project files ----------------
+  function projectFileName(name) {
+    var base = (name || "untitled").trim().toLowerCase()
+      .replace(/[^\w\- ]+/g, "").trim().replace(/[\s_]+/g, "-");
+    if (!base) base = "untitled";
+    return base + ".sp1200.json";
+  }
+  function downloadFile(filename, text, type) {
+    try {
+      if (typeof Blob === "undefined" || typeof URL === "undefined" || !URL.createObjectURL) return false;
+      var blob = new Blob([text], { type: type });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(url); if (a.remove) a.remove(); }, 800);
+      return true;
+    } catch (e) { return false; }
+  }
+  function exportProject() {
+    var name = (ui.projName && ui.projName.value || "").trim().slice(0, 40) || "untitled";
+    var text = JSON.stringify(serializeProject(name));
+    if (downloadFile(projectFileName(name), text, "application/json")) {
+      projStatus("Exported \u201c" + name + "\u201d");
+    } else {
+      projStatus("Export needs a full browser");
+    }
+  }
+  function importProjectFile(file) {
+    if (typeof FileReader === "undefined") { projStatus("Import needs a full browser"); return; }
+    var rd = new FileReader();
+    rd.onload = function () {
+      var proj;
+      try {
+        proj = JSON.parse(rd.result);
+        if (!proj || proj.version !== 1 || !Array.isArray(proj.pattern)) throw 0;
+      } catch (e) { projStatus("Import failed: not a valid project file"); return; }
+      var name = (proj.name || "imported").toString().slice(0, 40) || "imported";
+      proj.name = name;
+      try {
+        var idx = loadProjectIndex();
+        idx[name] = proj;
+        writeProjectIndex(idx);
+      } catch (e) { /* quota: load it anyway, just don't keep it listed */ }
+      loadProjectData(proj);
+      paintProjects();
+      projStatus("Imported \u201c" + name + "\u201d");
+    };
+    try { rd.readAsText(file); } catch (e) { projStatus("Import failed: can't read the file"); }
   }
   function projStatus(msg) {
     if (ui.projStatus) ui.projStatus.textContent = msg || "";
@@ -1685,6 +1740,26 @@
     saveB.textContent = "SAVE";
     saveB.setAttribute("aria-label", "Save project under this name");
     saveB.addEventListener("click", function () { saveProject(ui.projName.value); ui.projName.value = ""; });
+    var xrow = el("div", "proj-row", ui.projPanel);
+    var expB = el("button", "btn", xrow);
+    expB.textContent = "EXPORT";
+    expB.title = "Download this project as a .sp1200.json file";
+    expB.setAttribute("aria-label", "Export project to a file");
+    expB.addEventListener("click", exportProject);
+    var impB = el("button", "btn", xrow);
+    impB.textContent = "IMPORT";
+    impB.title = "Load a project from a .sp1200.json file";
+    impB.setAttribute("aria-label", "Import project from a file");
+    impB.addEventListener("click", function () { if (ui.projFile) ui.projFile.click(); });
+    ui.projFile = el("input", "", ui.projPanel);
+    ui.projFile.type = "file";
+    ui.projFile.accept = ".sp1200.json,.json,application/json";
+    ui.projFile.style.display = "none";
+    ui.projFile.setAttribute("aria-label", "Choose a project file to import");
+    ui.projFile.addEventListener("change", function () {
+      if (ui.projFile.files && ui.projFile.files[0]) importProjectFile(ui.projFile.files[0]);
+      ui.projFile.value = "";
+    });
     ui.projStatus = el("div", "proj-status", ui.projPanel);
     ui.projStatus.setAttribute("aria-live", "polite");
     ui.projList = el("div", "proj-list", ui.projPanel);
@@ -1837,7 +1912,7 @@
     });
 
     var foot = el("div", "foot", app);
-    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; LOAD puts your own samples through the 12-bit path &nbsp;·&nbsp; SLICE chops a long sample across the pads &nbsp;·&nbsp; MONO / CHK voice modes per strip &nbsp;·&nbsp; delay lives in EDIT &nbsp;·&nbsp; TAPE bounces the pattern to a 4-track loop &nbsp;·&nbsp; play runs drums + tape together &nbsp;·&nbsp; PANIC kills all sound &nbsp;·&nbsp; PROJECT saves / loads named projects";
+    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; LOAD puts your own samples through the 12-bit path &nbsp;·&nbsp; SLICE chops a long sample across the pads &nbsp;·&nbsp; MONO / CHK voice modes per strip &nbsp;·&nbsp; delay lives in EDIT &nbsp;·&nbsp; TAPE bounces the pattern to a 4-track loop &nbsp;·&nbsp; play runs drums + tape together &nbsp;·&nbsp; PANIC kills all sound &nbsp;·&nbsp; PROJECT saves / loads / exports / imports";
 
     // ---- keyboard ----
     document.addEventListener("keydown", function (e) {
@@ -1935,6 +2010,8 @@
     _anyTapePlaying: anyTapePlaying, _paintTransport: paintTransport,
     _saveProject: saveProject, _loadProject: loadProject, _deleteProject: deleteProject,
     _listProjects: loadProjectIndex, _paintProjects: paintProjects,
+    _exportProject: exportProject, _importProjectFile: importProjectFile,
+    _projectFileName: projectFileName,
     _serializeProject: serializeProject, _syncUI: syncUIFromState,
     _f32ToPcm16B64: f32ToPcm16B64, _pcm16B64ToF32: pcm16B64ToF32 };
   if (typeof window !== "undefined") window.SP1200 = api;

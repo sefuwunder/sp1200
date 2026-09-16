@@ -168,10 +168,22 @@ FakeOAC.prototype.startRendering = function () {
 };
 
 // ---- sandbox ----
+const dlCapture = {};
 const sandbox = {
   console: console,
   document: documentStub,
   window: { AudioContext: FakeAC, OfflineAudioContext: FakeOAC },
+  Blob: function (parts, opts) { dlCapture.parts = parts; dlCapture.type = opts && opts.type; },
+  URL: {
+    createObjectURL: function () { dlCapture.urlMade = true; return "blob:fake"; },
+    revokeObjectURL: function () {},
+  },
+  FileReader: function () {
+    this.readAsText = function (f) {
+      this.result = f._text;
+      if (this.onload) this.onload();
+    };
+  },
   localStorage: {
     _d: {},
     getItem: function (k) { return Object.prototype.hasOwnProperty.call(this._d, k) ? this._d[k] : null; },
@@ -610,6 +622,45 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
   ok(ui.projList.children.length === 1, "panel list updates after delete");
   SP._deleteProject("projtest");
   ok(Object.keys(SP._listProjects()).length === 0, "index empty after cleanup");
+
+  // ---- external save / load: project files ----
+  ok(SP._projectFileName("My Beat!") === "my-beat.sp1200.json", "export filename is sanitized");
+  ok(SP._projectFileName("") === "untitled.sp1200.json", "empty name falls back to untitled");
+  // rebuild a distinctive state to export
+  SP.state.bpm = 97;
+  SP.state.pattern.forEach(function (row) { row.fill(0); });
+  SP.state.pattern[2][7] = 1;
+  ui.projName.value = "My Beat!";
+  SP._exportProject();
+  ok(dlCapture.urlMade === true, "export creates a download");
+  ok(dlCapture.type === "application/json", "export is typed as JSON");
+  const exported = JSON.parse(dlCapture.parts[0]);
+  ok(exported.name === "My Beat!" && exported.version === 1, "exported payload carries name + version");
+  ok(exported.bpm === 97 && exported.pattern[2][7] === 1, "exported payload carries the project state");
+  ok(ui.projStatus.textContent.indexOf("Exported") >= 0, "export reports its status");
+  // mutate, then import the file back
+  SP.state.bpm = 60;
+  SP.state.pattern.forEach(function (row) { row.fill(0); });
+  SP._importProjectFile({ _text: dlCapture.parts[0], name: "my-beat.sp1200.json" });
+  ok(SP.state.bpm === 97, "import restores bpm from the file");
+  ok(SP.state.pattern[2][7] === 1 && SP.state.pattern[0][0] === 0, "import restores the pattern from the file");
+  ok(ui.stepBtns[2][7].classList.contains("on"), "imported pattern shows on the grid");
+  ok(!!SP._listProjects()["My Beat!"], "imported project joins the saved list");
+  ok(ui.projStatus.textContent.indexOf("Imported") >= 0, "import reports its status");
+  // corrupt file
+  SP._importProjectFile({ _text: "{nope", name: "bad.json" });
+  ok(ui.projStatus.textContent.indexOf("not a valid project file") >= 0, "corrupt import is rejected cleanly");
+  ok(SP.state.bpm === 97, "failed import leaves state untouched");
+  // IMPORT button opens the file picker
+  var pickerOpened = false;
+  ui.projFile.click = function () { pickerOpened = true; };
+  var xrow = ui.projPanel.children.filter(function (c) { return c.className === "proj-row"; })[1];
+  var impBtn = xrow.children.filter(function (c) { return c.textContent === "IMPORT"; })[0];
+  ok(!!impBtn, "IMPORT button exists in the panel");
+  impBtn.click();
+  ok(pickerOpened, "IMPORT opens the file picker");
+  SP._deleteProject("My Beat!");
+  ok(Object.keys(SP._listProjects()).length === 0, "index empty at the end");
 
   console.log("\nui: " + n + " passed");
 })().catch(function (e) { console.error("TAPE TESTS FAILED:", e); process.exit(1); });
