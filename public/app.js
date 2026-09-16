@@ -286,9 +286,7 @@
     curStep = 0;
     nextGridTime = ctx.currentTime + 0.08;
     timer = setInterval(schedulerTick, TICK_MS);
-    ui.playBtn.classList.add("playing");
-    ui.playBtn.textContent = "\u25a0"; // ■
-    ui.playBtn.setAttribute("aria-label", "Stop");
+    paintTransport();
   }
   function stopTransport() {
     if (!state.playing) return;
@@ -296,9 +294,49 @@
     if (timer) clearInterval(timer);
     timer = null;
     clearPlayhead();
-    ui.playBtn.classList.remove("playing");
-    ui.playBtn.textContent = "\u25b6"; // ▶
-    ui.playBtn.setAttribute("aria-label", "Play");
+    paintTransport();
+  }
+
+  // The main transport is global: the drum machine and the tape tracks
+  // start/stop together. The tape overlay keeps its own tape-only controls.
+  function anyTapePlaying() {
+    return state.tapes.some(function (t) { return t && t._src; });
+  }
+  function paintTransport() {
+    if (!ui.playBtn) return;
+    var playing = state.playing || anyTapePlaying();
+    ui.playBtn.classList.toggle("playing", playing);
+    ui.playBtn.textContent = playing ? "\u25a0" : "\u25b6"; // ■ / ▶
+    ui.playBtn.setAttribute("aria-label", playing ? "Stop drums + tape" : "Play drums + tape");
+  }
+  function globalPlay() {
+    ensureAudio();
+    startTransport();
+    tapePlayAll();
+    paintTransport();
+  }
+  function globalStop() {
+    stopTransport();
+    tapeStopAll();
+    paintTransport();
+  }
+  // Panic: silence every voice, delay tail, tape, and the sequencer, now.
+  function panic() {
+    ensureAudio();
+    var t = ctx.currentTime;
+    stopTransport();
+    tapeStopAll();
+    var VS = liveVS();
+    for (var i = 0; i < state.pads.length; i++) {
+      killStoreVoices(VS[i], t);
+      if (VS[i].delay) {
+        // choke the delay line itself; the next hit re-syncs from pad state
+        VS[i].delay.wet.gain.setTargetAtTime(0, t, 0.01);
+        VS[i].delay.fb.gain.setTargetAtTime(0, t, 0.01);
+      }
+    }
+    paintTape();
+    paintTransport();
   }
   function schedulerTick() {
     var d = DSP.sixteenthDur(state.bpm);
@@ -362,6 +400,7 @@
       try { t._src.stop(); } catch (e) {}
       t._src = null;
       t._gain = null;
+      paintTransport();
     }
   }
 
@@ -381,6 +420,7 @@
     t._src = src;
     t._gain = g;
     paintTape();
+    paintTransport();
   }
 
   function tapePlayAll() {
@@ -394,6 +434,7 @@
   function tapeStopAll() {
     for (var i = 0; i < TAPE_COUNT; i++) tapeStop(i);
     paintTape();
+    paintTransport();
   }
 
   function tapeToggleMute(i) {
@@ -1309,10 +1350,16 @@
     var transport = el("div", "transport", top);
     ui.playBtn = el("button", "play-btn", transport);
     ui.playBtn.textContent = "\u25b6";
-    ui.playBtn.setAttribute("aria-label", "Play");
+    ui.playBtn.setAttribute("aria-label", "Play drums + tape");
     ui.playBtn.addEventListener("click", function () {
-      if (state.playing) stopTransport(); else startTransport();
+      if (state.playing || anyTapePlaying()) globalStop(); else globalPlay();
     });
+
+    ui.panicBtn = el("button", "btn panic", transport);
+    ui.panicBtn.textContent = "PANIC";
+    ui.panicBtn.title = "Stop all sound immediately";
+    ui.panicBtn.setAttribute("aria-label", "Stop all sounds immediately");
+    ui.panicBtn.addEventListener("click", panic);
 
     ui.tempo = makeSlider(transport, "TEMPO", 60, 200, 1, state.bpm,
       function (v) { return Math.round(v) + " BPM"; },
@@ -1512,7 +1559,7 @@
     });
 
     var foot = el("div", "foot", app);
-    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; LOAD puts your own samples through the 12-bit path &nbsp;·&nbsp; SLICE chops a long sample across the pads &nbsp;·&nbsp; MONO / CHK voice modes per strip &nbsp;·&nbsp; delay lives in EDIT &nbsp;·&nbsp; TAPE bounces the pattern to a 4-track loop";
+    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; LOAD puts your own samples through the 12-bit path &nbsp;·&nbsp; SLICE chops a long sample across the pads &nbsp;·&nbsp; MONO / CHK voice modes per strip &nbsp;·&nbsp; delay lives in EDIT &nbsp;·&nbsp; TAPE bounces the pattern to a 4-track loop &nbsp;·&nbsp; play runs drums + tape together &nbsp;·&nbsp; PANIC kills all sound";
 
     // ---- keyboard ----
     document.addEventListener("keydown", function (e) {
@@ -1520,7 +1567,7 @@
       if (e.code === "Escape") { closeEditor(); closeSlicer(); closeTape(); return; }
       if (e.code === "Space") {
         e.preventDefault();
-        if (state.playing) stopTransport(); else startTransport();
+        if (state.playing || anyTapePlaying()) globalStop(); else globalPlay();
       } else {
         var n = parseInt(e.key, 10);
         if (n >= 1 && n <= 8) playPad(n - 1);
@@ -1600,7 +1647,9 @@
     _openTape: openTape, _closeTape: closeTape, _tape: function () { return tp; },
     _renderPattern: renderPattern, _bounceToTape: bounceToTape,
     _tapePlay: tapePlay, _tapeStop: tapeStop, _tapePlayAll: tapePlayAll, _tapeStopAll: tapeStopAll,
-    _tapeToSlicer: tapeToSlicer };
+    _tapeToSlicer: tapeToSlicer,
+    _globalPlay: globalPlay, _globalStop: globalStop, _panic: panic,
+    _anyTapePlaying: anyTapePlaying, _paintTransport: paintTransport };
   if (typeof window !== "undefined") window.SP1200 = api;
   else globalThis.SP1200 = api;
 

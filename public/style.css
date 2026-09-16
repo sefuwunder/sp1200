@@ -162,6 +162,12 @@ input[type="range"]:not(.vf)::-moz-range-thumb {
   box-shadow: 0 3px 0 #57534a, 0 5px 8px rgba(0,0,0,.3), inset 0 1px 0 rgba(255,255,255,.6);
 }
 .btn:active { transform: translateY(2px); box-shadow: 0 1px 0 #57534a, inset 0 2px 5px rgba(0,0,0,.3); }
+.btn.panic {
+  background: linear-gradient(180deg, #f06a5c, var(--red) 60%, #a3251b);
+  color: #fff; border-color: #6e1a13; text-shadow: 0 -1px 1px rgba(0,0,0,.5);
+  box-shadow: 0 3px 0 #6e1a13, 0 5px 8px rgba(0,0,0,.3), inset 0 1px 0 rgba(255,255,255,.4);
+}
+.btn.panic:active { box-shadow: 0 1px 0 #6e1a13, inset 0 2px 5px rgba(0,0,0,.3); }
 .btn.on {
   background: linear-gradient(180deg, #ffcf6b, var(--amber) 60%, #c07f00);
   color: #3a2400; border-color: #7a5200;

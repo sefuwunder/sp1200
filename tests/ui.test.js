@@ -491,5 +491,40 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
   listeners.keydown({ code: "Escape", target: {} });
   ok(tp.root.style.display === "none", "Escape closes the arranger");
 
+  // ---- global transport + panic ----
+  ok(ui.panicBtn.textContent === "PANIC", "transport has a PANIC button");
+  SP._bounceToTape(2);
+  await new Promise(function (r) { setTimeout(r, 60); });
+  ok(!!(SP.state.tapes[2] && SP.state.tapes[2].buffer), "track 3 holds a bounce for the global test");
+  SP._tapeStopAll();
+  ui.playBtn.click();
+  ok(SP.state.playing, "main play starts the drum sequencer");
+  ok(!!SP.state.tapes[2]._src, "main play also starts the tape tracks");
+  ok(ui.playBtn.textContent === "\u25a0", "main button shows stop while anything plays");
+  ui.playBtn.click();
+  ok(!SP.state.playing && !SP.state.tapes[2]._src, "main stop halts drums + tape");
+  ok(ui.playBtn.textContent === "\u25b6", "main button back to play when all is stopped");
+  SP._tapePlay(2);
+  ok(ui.playBtn.textContent === "\u25a0", "tape-only playback lights the main button too");
+  SP._tapeStopAll();
+  SP.state.pads[0].delay.on = true;
+  var v0 = SP.state.pads[0]._voices.length, v1 = SP.state.pads[1]._voices.length;
+  SP._playPad(0);
+  SP._playPad(1);
+  ok(SP.state.pads[0]._voices.length === v0 + 1 && SP.state.pads[1]._voices.length === v1 + 1, "voices ringing before panic");
+  const dly = SP.state.pads[0]._delay;
+  ok(!!dly, "delay nodes exist before panic");
+  SP._globalPlay();
+  ok(SP.state.playing && SP._anyTapePlaying(), "drums + tape running before panic");
+  SP._panic();
+  ok(!SP.state.playing, "panic stops the sequencer");
+  ok(!SP._anyTapePlaying(), "panic stops the tapes");
+  ok(SP.state.pads[0]._voices.length === 0 && SP.state.pads[1]._voices.length === 0, "panic clears every pad voice");
+  ok(dly.wet.gain.value === 0 && dly.fb.gain.value === 0, "panic chokes the delay lines");
+  ok(ui.playBtn.textContent === "\u25b6", "panic resets the main button");
+  SP._playPad(0);
+  ok(Math.abs(SP.state.pads[0]._delay.wet.gain.value - SP.state.pads[0].delay.mix) < 1e-9, "delay restores itself on the next hit");
+  SP.state.pads[0].delay.on = false;
+
   console.log("\nui: " + n + " passed");
 })().catch(function (e) { console.error("TAPE TESTS FAILED:", e); process.exit(1); });
