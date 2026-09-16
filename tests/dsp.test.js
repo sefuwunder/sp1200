@@ -93,4 +93,46 @@ ids.forEach(function (id) {
   ok(g[0] === 1 && g[99] === 1, "zero-length fades are a no-op");
 }
 
+
+// ---- onset detection ----
+function burstAt(sr, durSec, atSec, amp) {
+  const n = Math.floor(sr * durSec);
+  const x = new Float32Array(n);
+  const start = Math.floor(atSec * sr);
+  for (let i = 0; i < 4000 && start + i < n; i++) {
+    x[start + i] = (Math.random() * 2 - 1) * amp * Math.exp(-i / 900);
+  }
+  return x;
+}
+{
+  const sr = 44100;
+  const x = new Float32Array(sr * 2); // pure silence
+  ok(DSP.detectOnsets(x, sr).length === 0, "silence yields no onsets");
+}
+{
+  const sr = 44100;
+  const x = burstAt(sr, 2, 0.5, 0.9);
+  const x2 = burstAt(sr, 2, 1.2, 0.9);
+  for (let i = 0; i < x.length; i++) x[i] += x2[i];
+  const on = DSP.detectOnsets(x, sr);
+  ok(on.length === 2, "two drum hits yield two onsets (got " + on.length + ")");
+  ok(Math.abs(on[0] - 0.5 * sr) < 2048, "first onset lands near the first hit");
+  ok(Math.abs(on[1] - 1.2 * sr) < 2048, "second onset lands near the second hit");
+}
+{
+  const sr = 44100;
+  const x = burstAt(sr, 2, 0.5, 0.9);
+  const x2 = burstAt(sr, 2, 0.53, 0.9); // 30ms later: inside the min gap
+  for (let i = 0; i < x.length; i++) x[i] += x2[i];
+  const on = DSP.detectOnsets(x, sr);
+  ok(on.length === 1, "hits inside the min gap merge into one onset");
+}
+{
+  const tiny = new Float32Array(100);
+  ok(DSP.detectOnsets(tiny, 44100).length === 0, "tiny buffers return no onsets");
+  const x = burstAt(44100, 2, 0.5, 0.9);
+  const on = DSP.detectOnsets(x, 44100, { sensitivity: 1000 });
+  ok(on.length === 0, "very high sensitivity finds nothing");
+}
+
 console.log("\ndsp: " + n + " passed");

@@ -471,6 +471,351 @@
       (Math.max(p.selStart, p.selEnd) * secs).toFixed(2) + "s \u00b7 drag to select, TRIM crops";
   }
 
+  // ---------------- tape slicer ----------------
+  // Load a long sample ("tape"), drop markers to chop it into segments,
+  // audition each chop, and load any segment onto any pad through the
+  // 12-bit SP path. The tape itself is never persisted; loaded chops
+  // behave exactly like LOADed samples (undoable in the editor).
+  var sl = null; // lazily built slicer handles + tape state
+
+  function slicerSegments() {
+    // [{start, end}] in samples, derived from the sorted markers.
+    if (!sl || !sl.tape || !sl.tape.length) return [];
+    var marks = sl.markers.slice().sort(function (a, b) { return a - b; });
+    var bounds = [0];
+    for (var i = 0; i < marks.length; i++) bounds.push(Math.floor(marks[i] * sl.tape.length));
+    bounds.push(sl.tape.length);
+    var segs = [];
+    for (var j = 0; j + 1 < bounds.length; j++) {
+      if (bounds[j + 1] - bounds[j] >= 64) segs.push({ start: bounds[j], end: bounds[j + 1] });
+    }
+    return segs;
+  }
+
+  function buildSlicer() {
+    var root = el("div", "overlay", document.body);
+    root.style.display = "none";
+    var panel = el("div", "editor slicer", root);
+    var head = el("div", "ed-head", panel);
+    var title = el("div", "ed-title", head);
+    title.textContent = "TAPE SLICER";
+    var x = el("button", "btn ed-x", head);
+    x.textContent = "\u00d7";
+    x.setAttribute("aria-label", "Close tape slicer");
+    x.addEventListener("click", closeSlicer);
+    root.addEventListener("click", function (e) { if (e.target === root) closeSlicer(); });
+
+    var cv = el("canvas", "wave", panel);
+    cv.width = 640; cv.height = 170;
+
+    var info = el("div", "ed-info", panel);
+
+    var ops = el("div", "ed-ops", panel);
+    function opBtn(label, fn, aria) {
+      var b = el("button", "btn", ops);
+      b.textContent = label;
+      b.setAttribute("aria-label", aria || label);
+      b.addEventListener("click", fn);
+      return b;
+    }
+    var loadBtn = opBtn("LOAD TAPE", function () { sl.fileInput.click(); }, "Load a long sample to slice");
+    var fileInput = el("input", "", panel);
+    fileInput.type = "file";
+    fileInput.accept = "audio/*";
+    fileInput.style.display = "none";
+    fileInput.addEventListener("change", function () {
+      if (fileInput.files && fileInput.files[0]) loadTapeFile(fileInput.files[0]);
+      fileInput.value = "";
+    });
+    var nInput = el("input", "slicer-n", ops);
+    nInput.type = "number"; nInput.min = 2; nInput.max = 64; nInput.value = 8;
+    nInput.setAttribute("aria-label", "Number of equal slices");
+    opBtn("EQUAL", slicerEqual, "Chop the tape into N equal slices");
+    opBtn("AUTO", slicerAuto, "Detect transients and mark each hit");
+    opBtn("CLEAR", function () {
+      sl.markers = []; sl.selSeg = 0; syncSlicer();
+    }, "Remove all slice markers");
+
+    var chipsLab = el("div", "ed-flab", panel);
+    chipsLab.textContent = "SEGMENTS — TAP TO HEAR";
+    var chips = el("div", "seg-chips", panel);
+
+    var assign = el("div", "assign-row", panel);
+    var alab = el("span", "lab", assign); alab.textContent = "\u2192 PAD";
+    var padBtns = [];
+    for (var i = 0; i < PAD_DEFS.length; i++) {
+      (function (pi) {
+        var b = el("button", "btn", assign);
+        b.textContent = String(pi + 1);
+        b.setAttribute("aria-label", "Load selected segment onto pad " + (pi + 1));
+        b.addEventListener("click", function () { sliceToPad(pi); });
+        padBtns.push(b);
+      })(i);
+    }
+
+    var hint = el("div", "ed-hint", panel);
+    hint.textContent = "Click the waveform to drop a marker \u00b7 drag markers to move them \u00b7 double-click a marker to remove it \u00b7 tap a segment to hear it, then pick a pad.";
+
+    sl = {
+      root: root, title: title, canvas: cv, info: info, chips: chips,
+      nInput: nInput, fileInput: fileInput, padBtns: padBtns,
+      tape: null, tapeName: "", markers: [], selSeg: 0, chipBtns: [],
+      dragIdx: -1,
+    };
+
+    // marker interactions on the waveform
+    function frac(e) {
+      var r = (cv.getBoundingClientRect) ? cv.getBoundingClientRect() : { left: 0, width: cv.width };
+      var cx = (e.clientX - r.left) / (r.width || 1);
+      return clamp(cx, 0, 1);
+    }
+    function markerNear(f) {
+      var best = -1, bd = 12 / (cv.width || 640);
+      for (var i = 0; i < sl.markers.length; i++) {
+        var d = Math.abs(sl.markers[i] - f);
+        if (d < bd && (best < 0 || d < Math.abs(sl.markers[best] - f))) best = i;
+      }
+      return best;
+    }
+    cv.addEventListener("pointerdown", function (e) {
+      if (!sl.tape) return;
+      var f = frac(e);
+      var mi = markerNear(f);
+      if (mi >= 0) {
+        sl.dragIdx = mi;
+      } else {
+        sl.markers.push(clamp(f, 0.002, 0.998));
+        sl.dragIdx = -1;
+        // select the segment under the click
+        var segs = slicerSegments();
+        var s = Math.floor(f * sl.tape.length);
+        for (var i = 0; i < segs.length; i++) {
+          if (s >= segs[i].start && s < segs[i].end) { sl.selSeg = i; break; }
+        }
+        auditionSegment(sl.selSeg);
+      }
+      if (e.preventDefault) e.preventDefault();
+    });
+    cv.addEventListener("pointermove", function (e) {
+      if (sl.dragIdx < 0 || !sl.tape) return;
+      sl.markers[sl.dragIdx] = clamp(frac(e), 0.002, 0.998);
+      drawSlicerWave();
+    });
+    cv.addEventListener("pointerup", function () {
+      if (sl.dragIdx >= 0) { sl.dragIdx = -1; syncSlicer(); }
+    });
+    cv.addEventListener("dblclick", function (e) {
+      if (!sl.tape) return;
+      var mi = markerNear(frac(e));
+      if (mi >= 0) { sl.markers.splice(mi, 1); sl.selSeg = 0; syncSlicer(); }
+    });
+  }
+
+  function openSlicer() {
+    if (!sl) buildSlicer();
+    syncSlicer();
+    sl.root.style.display = "flex";
+  }
+  function closeSlicer() {
+    if (sl) sl.root.style.display = "none";
+  }
+
+  function syncSlicer() {
+    if (!sl) return;
+    sl.title.textContent = "TAPE SLICER" + (sl.tapeName ? " — " + sl.tapeName : "");
+    drawSlicerWave();
+    rebuildChips();
+    updateSlicerInfo();
+  }
+
+  function drawSlicerWave() {
+    if (!sl) return;
+    var cv = sl.canvas;
+    var g2d = cv.getContext && cv.getContext("2d");
+    if (!g2d) return;
+    var W = cv.width, H = cv.height;
+    g2d.fillStyle = "#060907";
+    g2d.fillRect(0, 0, W, H);
+    if (!sl.tape) {
+      g2d.fillStyle = "#8f959d";
+      g2d.font = "11px sans-serif";
+      g2d.textAlign = "center";
+      g2d.fillText("LOAD A TAPE TO START CHOPPING", W / 2, H / 2);
+      return;
+    }
+    var d = sl.tape, mid = H / 2, amp = H * 0.44;
+    // shade the selected segment
+    var segs = slicerSegments();
+    var seg = segs[Math.min(sl.selSeg, segs.length - 1)];
+    if (seg) {
+      g2d.fillStyle = "rgba(255,176,0,0.10)";
+      g2d.fillRect(seg.start / d.length * W, 0, (seg.end - seg.start) / d.length * W, H);
+    }
+    g2d.strokeStyle = "#ffb000";
+    g2d.lineWidth = 1;
+    g2d.beginPath();
+    for (var x = 0; x < W; x++) {
+      var a = Math.floor(x / W * d.length);
+      var b = Math.max(a + 1, Math.floor((x + 1) / W * d.length));
+      var mn = 1, mx = -1;
+      for (var k = a; k < b && k < d.length; k++) {
+        var v = d[k];
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+      }
+      if (mx < mn) { mx = 0; mn = 0; }
+      g2d.moveTo(x + 0.5, mid - mx * amp);
+      g2d.lineTo(x + 0.5, mid - mn * amp + 0.5);
+    }
+    g2d.stroke();
+    // markers, numbered
+    var marks = sl.markers.slice().sort(function (p, q) { return p - q; });
+    g2d.font = "9px sans-serif";
+    g2d.textAlign = "left";
+    for (var m = 0; m < marks.length; m++) {
+      var mxp = marks[m] * W;
+      g2d.strokeStyle = "#ffd47a";
+      g2d.lineWidth = 1.5;
+      g2d.beginPath();
+      g2d.moveTo(mxp, 0);
+      g2d.lineTo(mxp, H);
+      g2d.stroke();
+      g2d.fillStyle = "#ffd47a";
+      g2d.fillText(String(m + 1), mxp + 3, 11);
+    }
+  }
+
+  function rebuildChips() {
+    if (!sl) return;
+    sl.chips.innerHTML = "";
+    sl.chipBtns = [];
+    var segs = slicerSegments();
+    if (!segs.length) return;
+    var sr = DSP.SYNTH_RATE;
+    for (var i = 0; i < segs.length; i++) {
+      (function (idx) {
+        var b = el("button", "seg-chip", sl.chips);
+        b.textContent = (idx + 1) + "  " + (segs[idx].start / sr).toFixed(2) + "–" + (segs[idx].end / sr).toFixed(2) + "s";
+        b.setAttribute("aria-label", "Audition segment " + (idx + 1));
+        b.addEventListener("click", function () { auditionSegment(idx); });
+        sl.chipBtns.push(b);
+      })(i);
+    }
+    paintChips();
+  }
+  function paintChips() {
+    if (!sl) return;
+    for (var i = 0; i < sl.chipBtns.length; i++) {
+      sl.chipBtns[i].classList.toggle("sel", i === sl.selSeg);
+    }
+  }
+
+  function updateSlicerInfo() {
+    if (!sl) return;
+    if (!sl.tape) {
+      sl.info.textContent = "no tape loaded \u00b7 pick a long sample and chop it across the pads";
+      return;
+    }
+    var segs = slicerSegments();
+    var secs = sl.tape.length / DSP.SYNTH_RATE;
+    var s = segs[Math.min(sl.selSeg, segs.length - 1)];
+    sl.info.textContent = secs.toFixed(2) + "s \u00b7 " + segs.length + " segments" +
+      (s ? " \u00b7 seg " + (Math.min(sl.selSeg, segs.length - 1) + 1) + ": " +
+        (s.start / DSP.SYNTH_RATE).toFixed(2) + "–" + (s.end / DSP.SYNTH_RATE).toFixed(2) + "s" : "");
+  }
+
+  function auditionSegment(i) {
+    var segs = slicerSegments();
+    if (!segs[i] || !sl.tape) return;
+    sl.selSeg = i;
+    paintChips();
+    drawSlicerWave();
+    updateSlicerInfo();
+    ensureAudio();
+    var cut = sl.tape.slice(segs[i].start, segs[i].end);
+    var buf = ctx.createBuffer(1, cut.length, DSP.SYNTH_RATE);
+    buf.copyToChannel(cut, 0);
+    var src = ctx.createBufferSource();
+    src.buffer = buf;
+    var g = ctx.createGain();
+    g.gain.value = 0.9;
+    src.connect(g);
+    g.connect(masterGain);
+    src.start();
+  }
+
+  function sliceToPad(padIdx) {
+    var segs = slicerSegments();
+    if (!segs.length || !sl.tape) return;
+    sl.selSeg = Math.min(sl.selSeg, segs.length - 1);
+    var seg = segs[sl.selSeg];
+    var cut = sl.tape.slice(seg.start, seg.end);
+    if (cut.length < 64) return;
+    DSP.normalize(cut, 0.92);
+    var p = state.pads[padIdx];
+    pushUndo(p);
+    p.dataClean = cut;
+    refreshSample(padIdx); // re-derive the 12-bit SP buffer
+    p.customName = ("SLC " + (sl.selSeg + 1)).slice(0, 12).toUpperCase();
+    ui.padNames[padIdx].textContent = p.customName;
+    p.selStart = 0; p.selEnd = 1;
+    playPad(padIdx); // audition the chop through the SP path
+    save();
+    updateSlicerInfo();
+  }
+
+  function slicerEqual() {
+    if (!sl || !sl.tape) return;
+    var n = clamp(parseInt(sl.nInput.value, 10) || 8, 2, 64);
+    sl.nInput.value = n;
+    sl.markers = [];
+    for (var i = 1; i < n; i++) sl.markers.push(i / n);
+    sl.selSeg = 0;
+    syncSlicer();
+  }
+
+  function slicerAuto() {
+    if (!sl || !sl.tape) return;
+    var on = DSP.detectOnsets(sl.tape, DSP.SYNTH_RATE);
+    sl.markers = [];
+    for (var i = 0; i < on.length; i++) {
+      var f = on[i] / sl.tape.length;
+      if (f > 0.005 && f < 0.995) sl.markers.push(f);
+    }
+    sl.selSeg = 0;
+    syncSlicer();
+  }
+
+  function loadTapeFile(file) {
+    ensureAudio();
+    var rd = new FileReader();
+    rd.onload = function () {
+      var done = function (audioBuf) {
+        var ch = audioBuf.getChannelData(0);
+        slicerSetTape(DSP.resampleLinear(ch, audioBuf.sampleRate, DSP.SYNTH_RATE),
+          (file.name || "tape").replace(/\.\w+$/, ""));
+      };
+      try {
+        var r = ctx.decodeAudioData(rd.result);
+        if (r && r.then) r.then(done, function () {});
+        else ctx.decodeAudioData(rd.result, done, function () {});
+      } catch (e) { /* unreadable file */ }
+    };
+    rd.readAsArrayBuffer(file);
+  }
+
+  // Test hook + shared entry: install already-decoded tape data (at 44.1 kHz).
+  function slicerSetTape(data, name) {
+    if (!sl) buildSlicer();
+    var clean = Float32Array.from(data);
+    DSP.normalize(clean, 0.92);
+    sl.tape = clean;
+    sl.tapeName = String(name || "tape").replace(/\.\w+$/, "").slice(0, 18).toUpperCase();
+    sl.markers = [];
+    sl.selSeg = 0;
+    syncSlicer();
+  }
+
   // ---------------- UI ----------------
   function flashPad(idx) {
     var b = ui.padBtns[idx];
@@ -586,6 +931,12 @@
       ui.spBtn.classList.toggle("on", state.spMode);
       save();
     });
+
+    ui.sliceBtn = el("button", "btn", transport);
+    ui.sliceBtn.textContent = "SLICE";
+    ui.sliceBtn.title = "Chop a long sample into pad-ready segments";
+    ui.sliceBtn.setAttribute("aria-label", "Open the tape slicer");
+    ui.sliceBtn.addEventListener("click", openSlicer);
 
     var spec = el("div", "spec", transport);
     spec.innerHTML = "<b>26.04 kHz</b> · <b>12-BIT</b><br>VARISPEED TUNING";
@@ -710,12 +1061,12 @@
     });
 
     var foot = el("div", "foot", app);
-    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; LOAD puts your own samples through the 12-bit path";
+    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; LOAD puts your own samples through the 12-bit path &nbsp;·&nbsp; SLICE chops a long sample across the pads";
 
     // ---- keyboard ----
     document.addEventListener("keydown", function (e) {
       if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
-      if (e.code === "Escape") { closeEditor(); return; }
+      if (e.code === "Escape") { closeEditor(); closeSlicer(); return; }
       if (e.code === "Space") {
         e.preventDefault();
         if (state.playing) stopTransport(); else startTransport();
@@ -783,7 +1134,11 @@
     _start: startTransport, _stop: stopTransport,
     _setFilterType: setFilterType, _cycleFilter: cycleFilter,
     _openEditor: openEditor, _closeEditor: closeEditor,
-    _refreshSample: refreshSample, _drawWave: drawWave };
+    _refreshSample: refreshSample, _drawWave: drawWave,
+    _openSlicer: openSlicer, _closeSlicer: closeSlicer,
+    _slicerSetTape: slicerSetTape, _slicerEqual: slicerEqual, _slicerAuto: slicerAuto,
+    _slicerSegments: slicerSegments, _auditionSegment: auditionSegment, _sliceToPad: sliceToPad,
+    _slicer: function () { return sl; } };
   if (typeof window !== "undefined") window.SP1200 = api;
   else globalThis.SP1200 = api;
 

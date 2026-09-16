@@ -196,4 +196,78 @@ ok(Object.prototype.toString.call(p.dataSP) === "[object Float32Array]", "re-der
 SP._scheduleStep(0, 0);
 ok(true, "scheduleStep runs without throwing");
 
+
+
+// ---- tape slicer ----
+ok(ui.sliceBtn && ui.sliceBtn.textContent === "SLICE", "SLICE button in the transport bar");
+SP._openSlicer();
+let sl = SP._slicer();
+ok(sl && sl.root.style.display === "flex", "slicer overlay opens");
+
+function burstTape(sr, hits) {
+  const x = new Float32Array(sr * 2);
+  hits.forEach(function (at) {
+    const start = Math.floor(at * sr);
+    for (let i = 0; i < 3000 && start + i < x.length; i++) {
+      x[start + i] += (Math.random() * 2 - 1) * 0.9 * Math.exp(-i / 800);
+    }
+  });
+  return x;
+}
+const SR = 44100;
+SP._slicerSetTape(burstTape(SR, [0.25, 0.75, 1.25, 1.75]), "testtape");
+sl = SP._slicer();
+ok(sl.tape.length === SR * 2, "synthetic tape installed at 44.1 kHz");
+ok(sl.title.textContent.indexOf("TESTTAPE") >= 0, "slicer title names the tape");
+
+sl.nInput.value = 4;
+SP._slicerEqual();
+let segs = SP._slicerSegments();
+ok(segs.length === 4, "EQUAL chops the tape into 4 segments");
+ok(Math.abs(segs[1].start - SR * 0.5) < 2 && Math.abs(segs[3].end - SR * 2) < 2, "equal segments tile the tape edge to edge");
+ok(sl.chipBtns.length === 4, "one audition chip per segment");
+
+SP._slicerAuto();
+ok(sl.markers.length === 4, "AUTO detects the 4 drum hits (got " + sl.markers.length + ")");
+segs = SP._slicerSegments();
+ok(segs.length === 5, "4 transient markers make 5 segments");
+ok(Math.abs(segs[2].start / SR - 0.75) < 0.05, "transient segment starts at the second hit");
+
+SP._slicerSetTape(burstTape(SR, [0.5]), "clicktest");
+sl = SP._slicer();
+sl.canvas._handlers.pointerdown[0]({ clientX: 320, preventDefault: function () {} });
+ok(sl.markers.length === 1 && Math.abs(sl.markers[0] - 0.5) < 0.01, "clicking the waveform drops a marker");
+segs = SP._slicerSegments();
+ok(segs.length === 2 && segs[0].end === segs[1].start, "one marker splits the tape in two");
+sl.canvas._handlers.dblclick[0]({ clientX: 320 });
+ok(sl.markers.length === 0, "double-clicking a marker removes it");
+
+// unsorted markers still tile correctly
+sl.markers = [0.75, 0.25];
+segs = SP._slicerSegments();
+ok(segs.length === 3 && segs[0].start === 0 && segs[2].end === SR * 2, "segments sort markers and span the tape");
+
+// audition a segment
+SP._slicerEqual();
+SP._auditionSegment(1);
+ok(ac().lastSource.buffer.sampleRate === 44100, "segment audition plays the clean 44.1 kHz buffer");
+ok(ac().lastSource.buffer._data.length === SP._slicerSegments()[1].end - SP._slicerSegments()[1].start, "auditioned buffer matches the segment");
+
+// load a segment onto a pad
+const before = SP.state.pads[2].dataClean.length;
+SP._sliceToPad(2);
+const p2 = SP.state.pads[2];
+ok(p2.customName === "SLC 2", "loaded chop is named after the selected segment");
+ok(ui.padNames[2].textContent === "SLC 2", "pad strip label follows the chop");
+ok(p2.dataClean.length !== before, "pad sample replaced by the segment");
+ok(Object.prototype.toString.call(p2.dataSP) === "[object Float32Array]" && p2.dataSP.length > 0, "12-bit SP buffer re-derived for the chop");
+ok(p2._undo && p2._undo.length === 1, "chop load is undoable in the editor");
+
+SP._closeSlicer();
+ok(SP._slicer().root.style.display === "none", "slicer closes");
+SP._openSlicer();
+listeners.keydown({ code: "Escape", target: {} });
+ok(SP._slicer().root.style.display === "none", "Escape closes the slicer");
+
+
 console.log("\nui: " + n + " passed");

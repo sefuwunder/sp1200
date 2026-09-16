@@ -381,6 +381,48 @@ input[type="range"].vf::-moz-range-thumb {
 .editor .ctl { margin-bottom: 6px; }
 .editor .ctl label { color: var(--silk); text-shadow: 0 -1px 1px rgba(0,0,0,.8); }
 
+/* ---------- tape slicer ---------- */
+.editor.slicer { width: min(760px, 100%); }
+.slicer-n {
+  width: 58px; flex: none;
+  background: #060907; color: var(--amber-hot);
+  border: 1px solid #000; border-radius: 6px;
+  font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 12px;
+  padding: 8px 6px; text-align: center;
+  box-shadow: inset 0 2px 6px rgba(0,0,0,.8);
+}
+.slicer-n:focus { outline: 1px solid var(--amber); }
+.seg-chips {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  max-height: 84px; overflow-y: auto;
+  margin: 8px 0 4px; padding: 2px;
+}
+.seg-chip {
+  font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 10px;
+  color: var(--amber); background: #101216;
+  border: 1px solid #000; border-radius: 6px;
+  padding: 7px 9px; cursor: pointer;
+  box-shadow: 0 2px 0 rgba(0,0,0,.6);
+}
+.seg-chip:active { transform: translateY(1px); box-shadow: none; }
+.seg-chip.sel {
+  background: linear-gradient(180deg, var(--amber-hot), var(--amber));
+  color: #1a1206; font-weight: 800;
+  box-shadow: 0 0 10px rgba(255,176,0,.45);
+}
+.assign-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 10px 0 4px; }
+.assign-row .lab {
+  font-size: 10px; letter-spacing: 2px; font-weight: 800;
+  color: var(--silk-dim); text-shadow: 0 -1px 1px rgba(0,0,0,.8);
+  margin-right: 2px;
+}
+.assign-row .btn { min-width: 40px; padding: 8px 10px; font-size: 11px; }
+.ed-hint {
+  font-size: 10px; line-height: 1.6; color: var(--silk-dim);
+  margin: 10px 2px 0; letter-spacing: .3px;
+}
+.slicer .ed-flab { margin: 12px 0 4px; }
+
 /* ---------- presets / footer ---------- */
 .presets { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; justify-content: center; }
 .foot { margin-top: 26px; text-align: center; font-size: 12px; font-weight: 600; letter-spacing: .5px; color: var(--silk-dim); text-shadow: 0 -1px 1px rgba(0,0,0,.8); }

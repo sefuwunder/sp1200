@@ -238,11 +238,53 @@
     return out;
   }
 
+  // ---------- tape slicer: transient (onset) detection ----------
+
+  // Energy-flux onset detection: returns sample offsets where the signal's
+  // short-time energy jumps, i.e. the starts of drum hits / chops in a loop.
+  // opts: window (default 1024), hop (default 512), sensitivity (default 1.5;
+  //   threshold = mean(flux) * sensitivity), minGapSec (default 0.08).
+  function detectOnsets(x, sr, opts) {
+    opts = opts || {};
+    const win = opts.window || 1024;
+    const hop = opts.hop || 512;
+    const sensitivity = opts.sensitivity == null ? 1.5 : opts.sensitivity;
+    const minGapSec = opts.minGapSec == null ? 0.08 : opts.minGapSec;
+    if (!x || x.length < win * 2) return [];
+
+    // RMS energy per frame.
+    const frames = [];
+    for (let i = 0; i + win <= x.length; i += hop) {
+      let e = 0;
+      for (let j = i; j < i + win; j++) e += x[j] * x[j];
+      frames.push(Math.sqrt(e / win));
+    }
+    // Positive energy differences (flux), thresholded at mean * sensitivity.
+    const flux = new Array(frames.length).fill(0);
+    for (let f = 1; f < frames.length; f++) flux[f] = Math.max(0, frames[f] - frames[f - 1]);
+    let mean = 0;
+    for (let f = 0; f < flux.length; f++) mean += flux[f];
+    mean /= flux.length;
+    const thr = mean * sensitivity + 1e-9;
+    const minGapFrames = Math.max(1, Math.round((minGapSec * sr) / hop));
+
+    const onsets = [];
+    let last = -minGapFrames;
+    for (let f = 1; f < flux.length; f++) {
+      if (flux[f] > thr && f - last >= minGapFrames) {
+        onsets.push(f * hop);
+        last = f;
+      }
+    }
+    return onsets;
+  }
+
   return {
     SP_RATE, SP_BITS, SYNTH_RATE, SYNTHS, SYNTHS_RAW,
     resampleLinear, quantize12, sp1200ize,
     lowpass, highpass, normalize,
     trimSample, reverseSample, fadeSample,
+    detectOnsets,
     sixteenthDur, stepTime16,
   };
 });
