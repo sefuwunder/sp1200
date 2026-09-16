@@ -434,6 +434,32 @@ input[type="range"].vf::-moz-range-thumb {
   box-shadow: 0 2px 3px rgba(0,0,0,.5);
 }
 
+/* ---- tape arranger ---- */
+.editor.tape { width: min(760px, 100%); }
+.tp-bar { display: flex; gap: 6px; margin-bottom: 12px; }
+.tp-bar .btn { flex: 1; padding: 9px 4px; font-size: 11px; white-space: nowrap; }
+.tp-tracks { display: grid; gap: 10px; }
+.tp-track {
+  background: rgba(0,0,0,.35); border: 1px solid #000; border-radius: 10px;
+  padding: 10px 12px; box-shadow: inset 0 2px 8px rgba(0,0,0,.6);
+}
+.tp-track.playing { border-color: #7a5200; box-shadow: inset 0 2px 8px rgba(0,0,0,.6), 0 0 12px rgba(255,176,0,.25); }
+.tp-thead { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 6px; }
+.tp-tname { font-size: 11px; letter-spacing: 2px; font-weight: 800; color: var(--silk); text-shadow: 0 -1px 1px rgba(0,0,0,.8); }
+.tp-status {
+  font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 10px;
+  color: var(--amber-hot); text-shadow: 0 0 6px rgba(255,176,0,.5); letter-spacing: .5px;
+}
+.tp-wave {
+  display: block; width: 100%; height: 60px;
+  border-radius: 6px; border: 1px solid #000; background: #060907;
+  box-shadow: inset 0 3px 10px rgba(0,0,0,.9); margin-bottom: 8px;
+}
+.tp-tops { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.tp-tops .btn { flex: 1 1 60px; padding: 7px 4px; font-size: 9px; white-space: nowrap; }
+.tp-tops .btn.dim { opacity: .35; }
+.editor.tape .ctl { margin-bottom: 2px; }
+
 @media (prefers-reduced-motion: reduce) {
   .pad, .play-btn, .btn, .step { transition: none; }
   .play-btn.playing, .step.on, .pad.hit { box-shadow: none; }

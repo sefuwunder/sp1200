@@ -129,11 +129,49 @@ FakeAC.prototype.createDynamicsCompressor = function () {
 };
 FakeAC.prototype.resume = function () {};
 
+// ---- OfflineAudioContext stub ----
+function FakeOAC(channels, length, sampleRate) {
+  FakeAC.call(this);
+  this.numberOfChannels = channels;
+  this._renderLength = length;
+  this.sampleRate = sampleRate;
+  this.sources = [];
+}
+FakeOAC.prototype = Object.create(FakeAC.prototype);
+FakeOAC.prototype.constructor = FakeOAC;
+FakeOAC.prototype.createBufferSource = function () {
+  const s = FakeAC.prototype.createBufferSource.call(this);
+  const self = this;
+  s._loopFlag = false;
+  const rawStart = s.start;
+  s.start = function (t) {
+    self.sources.push({ src: s, at: t == null ? 0 : t, loop: s._loopFlag });
+    rawStart.call(s, t);
+  };
+  Object.defineProperty(s, "loop", {
+    get: function () { return s._loopFlag; },
+    set: function (v) { s._loopFlag = !!v; },
+    configurable: true,
+  });
+  return s;
+};
+FakeOAC.prototype.startRendering = function () {
+  const len = this._renderLength, sr = this.sampleRate, ch = this.numberOfChannels;
+  const buf = {
+    sampleRate: sr,
+    length: len,
+    duration: len / sr,
+    numberOfChannels: ch,
+    getChannelData: function () { return new Float32Array(len); },
+  };
+  return Promise.resolve(buf);
+};
+
 // ---- sandbox ----
 const sandbox = {
   console: console,
   document: documentStub,
-  window: { AudioContext: FakeAC },
+  window: { AudioContext: FakeAC, OfflineAudioContext: FakeOAC },
   localStorage: {
     _d: {},
     getItem: function (k) { return Object.prototype.hasOwnProperty.call(this._d, k) ? this._d[k] : null; },
@@ -356,4 +394,102 @@ ok(vsaved.pads[4].choke === 1, "choke group persists to localStorage");
 ok(vsaved.pads[2].delay.on === false, "delay disable persists to localStorage");
 ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to localStorage");
 
-console.log("\nui: " + n + " passed");
+// ---- tape: bounce + 4-track arranger (async) ----
+(async function () {
+  ok(SP.state.tapes.length === 4, "four tape tracks exist");
+  ok(SP.state.tapes.every(function (t) { return !t.buffer; }), "tracks ship empty");
+  ok(typeof ui.tapeBtn !== "undefined" && ui.tapeBtn.textContent === "TAPE", "transport has a TAPE button");
+
+  // deterministic pattern: kick on steps 0 and 1, swing 75, 120 BPM
+  SP.state.pattern.forEach(function (row) { row.fill(0); });
+  SP.state.pattern[0][0] = 1;
+  SP.state.pattern[0][1] = 1;
+  SP.state.bpm = 120;
+  SP.state.swing = 75;
+  SP.state.pads[0].voiceMode = "poly";
+  SP.state.pads[0].choke = 0;
+  SP.state.pads[0].muted = false;
+
+  const buf = await SP._renderPattern(1);
+  const d = 60 / 120 / 4; // 0.125s per 16th
+  ok(buf.length === Math.ceil(16 * d * 44100), "bounce buffer length matches 1 bar at 44.1kHz");
+  ok(buf.numberOfChannels === 2, "bounce renders stereo");
+  const ocx = FakeAC.instances[FakeAC.instances.length - 1];
+  const hits = ocx.sources.map(function (r) { return r.at; }).sort(function (a, b) { return a - b; });
+  // step 0 on the grid, step 1 (odd 16th) slid late by swing 75: 0.75 * 2 * d
+  ok(hits.length === 2, "two scheduled hits in the bounce");
+  ok(Math.abs(hits[0] - 0) < 1e-9, "even 16th stays on the grid in the bounce");
+  ok(Math.abs(hits[1] - 0.75 * 2 * d) < 1e-9, "odd 16th slides late with swing in the bounce");
+
+  // parity with the live scheduler: scheduleStep uses
+  // t = gridTime + (stepTime16(s) - s*d) with gridTime = b*barDur + s*d,
+  // which collapses to b*barDur + stepTime16(s) — exactly the bounce formula
+  ok(Math.abs(hits[1] - sandbox.DSP.stepTime16(1, 120, 75)) < 1e-9, "bounce timing matches scheduleStep swing math");
+
+  // 2-bar bounce doubles the hits
+  const buf2 = await SP._renderPattern(2);
+  const ocx2 = FakeAC.instances[FakeAC.instances.length - 1];
+  ok(ocx2.sources.length === 4, "2-bar bounce schedules both bars");
+  ok(buf2.length === 2 * buf.length, "2-bar buffer is twice as long");
+
+  // arranger UI
+  ui.tapeBtn.click();
+  const tp = SP._tape();
+  ok(tp.root.style.display === "flex", "TAPE button opens the arranger");
+  ok(tp.rows.length === 4, "arranger shows four tracks");
+  ok(tp.barsBtn.textContent === "BARS 2", "bounce length defaults to 2 bars");
+  tp.barsBtn.click();
+  ok(tp.barsBtn.textContent === "BARS 4", "BARS cycles 2 -> 4");
+  tp.barsBtn.click();
+  ok(tp.barsBtn.textContent === "BARS 1", "BARS cycles 4 -> 1");
+  tp.barsBtn.click();
+  ok(tp.barsBtn.textContent === "BARS 2", "BARS cycles 1 -> 2");
+
+  // bounce track 1 -> auto-loops
+  SP._bounceToTape(0);
+  ok(SP.state.tapes[0].bouncing, "track shows bouncing state");
+  await new Promise(function (r) { setTimeout(r, 20); });
+  const t0 = SP.state.tapes[0];
+  ok(!t0.bouncing && !!t0.buffer, "bounce lands a buffer on the track");
+  ok(t0.bars === 2 && t0.bpm === 120, "track records bars + bpm");
+  ok(!!t0._src, "bounced track auto-plays its loop");
+  ok(t0._src.loop === true, "tape playback source loops");
+  ok(tp.rows[0].root.classList.contains("playing"), "playing track is highlighted");
+  ok(/2 bars/.test(tp.rows[0].status.textContent), "track status shows the bounce");
+
+  // mute + level
+  tp.rows[0].muteBtn.click();
+  ok(t0.muted, "MUTE toggles the track");
+  ok(Math.abs(t0._gain.gain.value - 0) < 1e-9, "mute ducks the track gain");
+  tp.rows[0].muteBtn.click();
+  ok(!t0.muted && Math.abs(t0._gain.gain.value - t0.level) < 1e-9, "unmute restores the track gain");
+  tp.rows[0].level.input.value = "50";
+  tp.rows[0].level.input._handlers.input[0]();
+  ok(Math.abs(t0.level - 0.5) < 1e-9, "LEVEL slider sets the track level");
+
+  // second track, then global stop
+  SP._bounceToTape(1);
+  await new Promise(function (r) { setTimeout(r, 20); });
+  ok(!!SP.state.tapes[1]._src, "second track loops too");
+  SP._tapeStopAll();
+  ok(!SP.state.tapes[0]._src && !SP.state.tapes[1]._src, "STOP halts all tracks");
+
+  // -> slicer glue
+  SP._tapeToSlicer(0);
+  ok(tp.root.style.display === "none", "send-to-slicer closes the arranger");
+  ok(SP._slicer().root.style.display === "flex", "send-to-slicer opens the slicer");
+  ok(SP._slicer().tape && SP._slicer().tape.length === t0.buffer.length, "bounced audio lands in the slicer");
+  SP._closeSlicer();
+
+  // clear
+  ui.tapeBtn.click();
+  tp.rows[0].clearBtn.click();
+  ok(!SP.state.tapes[0].buffer, "CLEAR empties the track");
+  ok(tp.rows[0].status.textContent === "EMPTY", "cleared track reads EMPTY");
+
+  // Escape closes
+  listeners.keydown({ code: "Escape", target: {} });
+  ok(tp.root.style.display === "none", "Escape closes the arranger");
+
+  console.log("\nui: " + n + " passed");
+})().catch(function (e) { console.error("TAPE TESTS FAILED:", e); process.exit(1); });

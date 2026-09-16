@@ -66,6 +66,7 @@
     bpm: 92, swing: 62, master: 80, spMode: true, playing: false,
     pads: [],      // { def, dataSP, dataClean, tune, level, muted, customName }
     pattern: [],   // [padIdx][step] -> 0/1
+    tapes: [],     // 4 tape tracks: { buffer, bars, bpm, name, level, muted, bouncing, _src, _gain }
   };
 
   var ui = {};      // element handles, filled by buildUI()
@@ -162,64 +163,86 @@
     }
   }
 
-  function killPadVoices(idx, t) {
-    var p = state.pads[idx];
-    var vs = p._voices || [];
-    p._voices = [];
+  // A voice store holds one pad's live voices + delay nodes on one context.
+  function newVoiceStore() { return { voices: [], delay: null }; }
+
+  function killStoreVoices(st, t) {
+    var vs = st.voices.slice();
+    st.voices.length = 0;
     for (var i = 0; i < vs.length; i++) stopVoice(vs[i], t);
   }
 
   // ---- per-pad delay effect (shared nodes, lazily created) ----
-  function padDelay(idx) {
-    var p = state.pads[idx];
-    if (!p._delay) {
-      var d = ctx.createDelay(1.0);
-      var fb = ctx.createGain();
-      var wet = ctx.createGain();
+  function storeDelay(ac, dest, st) {
+    if (!st.delay) {
+      var d = ac.createDelay(1.0);
+      var fb = ac.createGain();
+      var wet = ac.createGain();
       wet.gain.value = 0;
       d.connect(fb);
       fb.connect(d);
       d.connect(wet);
-      wet.connect(masterGain);
-      p._delay = { node: d, fb: fb, wet: wet };
+      wet.connect(dest);
+      st.delay = { node: d, fb: fb, wet: wet };
     }
-    return p._delay;
+    return st.delay;
+  }
+
+  function syncStoreDelay(ac, st, p) {
+    if (!st.delay) return;
+    var t = ac.currentTime;
+    st.delay.node.delayTime.setTargetAtTime(clamp(p.delay.time, 0.03, 1), t, 0.02);
+    st.delay.fb.gain.setTargetAtTime(clamp(p.delay.feedback, 0, 0.85), t, 0.02);
+    st.delay.wet.gain.setTargetAtTime(p.delay.on ? clamp(p.delay.mix, 0, 0.6) : 0, t, 0.02);
+  }
+
+  // Facade so the generic trigger reads/writes a pad's live voice state.
+  function liveVS() {
+    return state.pads.map(function (p) {
+      return {
+        get voices() { return p._voices || (p._voices = []); },
+        set voices(v) { p._voices = v; },
+        get delay() { return p._delay; },
+        set delay(d) { p._delay = d; }
+      };
+    });
+  }
+
+  function padDelay(idx) {
+    return storeDelay(ctx, masterGain, liveVS()[idx]);
   }
 
   function syncDelay(idx) {
-    var p = state.pads[idx];
-    if (!p._delay || !ctx) return;
-    var t = ctx.currentTime;
-    p._delay.node.delayTime.setTargetAtTime(clamp(p.delay.time, 0.03, 1), t, 0.02);
-    p._delay.fb.gain.setTargetAtTime(clamp(p.delay.feedback, 0, 0.85), t, 0.02);
-    p._delay.wet.gain.setTargetAtTime(p.delay.on ? clamp(p.delay.mix, 0, 0.6) : 0, t, 0.02);
+    if (!ctx) return;
+    syncStoreDelay(ctx, liveVS()[idx], state.pads[idx]);
   }
 
-  function playPad(idx, when) {
+  // Generic pad trigger on any BaseAudioContext. VS is an array of voice
+  // stores (one per pad); the live path passes liveVS(), the bounce render
+  // passes fresh stores on an OfflineAudioContext.
+  function playPadOn(ac, dest, idx, t0, VS) {
     var p = state.pads[idx];
-    if (!p || p.muted) return;
-    ensureAudio();
-    var t0 = when == null ? ctx.currentTime : when;
+    if (!p || p.muted) return null;
     // Choke groups: a hit cuts every other pad sharing its group.
     if (p.choke) {
       for (var c = 0; c < state.pads.length; c++) {
-        if (c !== idx && state.pads[c].choke === p.choke) killPadVoices(c, t0);
+        if (c !== idx && state.pads[c].choke === p.choke) killStoreVoices(VS[c], t0);
       }
     }
     // Mono: retriggering cuts this pad's own tail.
-    if (p.voiceMode === "mono") killPadVoices(idx, t0);
+    if (p.voiceMode === "mono") killStoreVoices(VS[idx], t0);
     var useSP = state.spMode;
     var data = useSP ? p.dataSP : p.dataClean;
     var rate = useSP ? DSP.SP_RATE : DSP.SYNTH_RATE;
-    var buf = ctx.createBuffer(1, data.length, rate);
+    var buf = ac.createBuffer(1, data.length, rate);
     buf.copyToChannel(data, 0);
-    var src = ctx.createBufferSource();
+    var src = ac.createBufferSource();
     src.buffer = buf;
     src.playbackRate.value = p.tune; // varispeed, exactly like the hardware
-    var g = ctx.createGain();
+    var g = ac.createGain();
     g.gain.value = p.level;
     if (p.filterType !== "off") {
-      var flt = ctx.createBiquadFilter();
+      var flt = ac.createBiquadFilter();
       flt.type = p.filterType; // lowpass | bandpass | highpass
       flt.frequency.value = p.filterFreq;
       flt.Q.value = p.filterQ;
@@ -228,20 +251,27 @@
     } else {
       src.connect(g);
     }
-    g.connect(masterGain);
+    g.connect(dest);
     if (p.delay.on) {
-      var dl = padDelay(idx);
-      syncDelay(idx);
+      var dl = storeDelay(ac, dest, VS[idx]);
+      syncStoreDelay(ac, VS[idx], p);
       g.connect(dl.node);
     }
     var voice = { src: src, gain: g };
-    p._voices = p._voices || [];
-    p._voices.push(voice);
+    VS[idx].voices.push(voice);
     src.onended = function () {
-      var a = p._voices.indexOf(voice);
-      if (a >= 0) p._voices.splice(a, 1);
+      var a = VS[idx].voices.indexOf(voice);
+      if (a >= 0) VS[idx].voices.splice(a, 1);
     };
     src.start(t0);
+    return voice;
+  }
+
+  function playPad(idx, when) {
+    var p = state.pads[idx];
+    if (!p || p.muted) return;
+    ensureAudio();
+    playPadOn(ctx, masterGain, idx, when == null ? ctx.currentTime : when, liveVS());
     flashPad(idx);
   }
 
@@ -287,6 +317,139 @@
     }
     var ms = Math.max(0, (t - ctx.currentTime) * 1000);
     setTimeout(function () { if (state.playing) highlightStep(step); }, ms);
+  }
+
+  // ---------------- tape: bounce + 4-track arranger ----------------
+  var TAPE_COUNT = 4;
+  var BOUNCE_SR = 44100;
+
+  function freshTape(i) {
+    return { buffer: null, bars: 0, bpm: 0, name: "TRACK " + (i + 1),
+             level: 0.8, muted: false, bouncing: false, _src: null, _gain: null };
+  }
+
+  // Render the current pattern (with swing, choke, mono, filters, delay —
+  // exactly what the live transport would play) to a stereo buffer.
+  function renderPattern(bars) {
+    var OC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    var d = DSP.sixteenthDur(state.bpm);
+    var barDur = d * STEPS;
+    var oc = new OC(2, Math.max(1, Math.ceil(barDur * bars * BOUNCE_SR)), BOUNCE_SR);
+    var master = oc.createGain();
+    master.gain.value = state.master / 100;
+    var comp = oc.createDynamicsCompressor();
+    comp.threshold.value = -18;
+    comp.ratio.value = 4;
+    master.connect(comp);
+    comp.connect(oc.destination);
+    var VS = state.pads.map(function () { return newVoiceStore(); });
+    for (var b = 0; b < bars; b++) {
+      for (var s = 0; s < STEPS; s++) {
+        // same swing math as scheduleStep: gridTime = b*barDur + s*d,
+        // t = gridTime + (stepTime16(s) - s*d)
+        var t = b * barDur + DSP.stepTime16(s, state.bpm, state.swing);
+        for (var i = 0; i < state.pads.length; i++) {
+          if (state.pattern[i][s]) playPadOn(oc, master, i, t, VS);
+        }
+      }
+    }
+    return oc.startRendering();
+  }
+
+  function tapeStop(i) {
+    var t = state.tapes[i];
+    if (t && t._src) {
+      try { t._src.stop(); } catch (e) {}
+      t._src = null;
+      t._gain = null;
+    }
+  }
+
+  function tapePlay(i) {
+    var t = state.tapes[i];
+    if (!t || !t.buffer || t.bouncing) return;
+    ensureAudio();
+    tapeStop(i);
+    var src = ctx.createBufferSource();
+    src.buffer = t.buffer;
+    src.loop = true;
+    var g = ctx.createGain();
+    g.gain.value = t.muted ? 0 : t.level;
+    src.connect(g);
+    g.connect(masterGain);
+    src.start();
+    t._src = src;
+    t._gain = g;
+    paintTape();
+  }
+
+  function tapePlayAll() {
+    for (var i = 0; i < TAPE_COUNT; i++) {
+      var t = state.tapes[i];
+      if (t && t.buffer && !t.bouncing && !t.muted) tapePlay(i);
+    }
+    paintTape();
+  }
+
+  function tapeStopAll() {
+    for (var i = 0; i < TAPE_COUNT; i++) tapeStop(i);
+    paintTape();
+  }
+
+  function tapeToggleMute(i) {
+    var t = state.tapes[i];
+    if (!t) return;
+    t.muted = !t.muted;
+    if (t._gain && ctx) t._gain.gain.setTargetAtTime(t.muted ? 0 : t.level, ctx.currentTime, 0.02);
+    paintTape();
+  }
+
+  function tapeSetLevel(i, v) {
+    var t = state.tapes[i];
+    if (!t) return;
+    t.level = clamp(v, 0, 1);
+    if (t._gain && ctx && !t.muted) t._gain.gain.setTargetAtTime(t.level, ctx.currentTime, 0.02);
+  }
+
+  function tapeClear(i) {
+    tapeStop(i);
+    state.tapes[i] = freshTape(i);
+    paintTape();
+  }
+
+  function bounceToTape(i) {
+    var t = state.tapes[i];
+    if (!t || t.bouncing) return;
+    var OC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!OC) { t.bounceError = true; paintTape(); return; }
+    tapeStop(i);
+    t.bouncing = true;
+    t.bounceError = false;
+    paintTape();
+    var bars = ui.tapeBars || 2;
+    renderPattern(bars).then(function (buf) {
+      t.buffer = buf;
+      t.bars = bars;
+      t.bpm = state.bpm;
+      t.name = "BOUNCE " + (i + 1);
+      t.bouncing = false;
+      paintTape();
+      drawTapeWave(i);
+      tapePlay(i); // bounce straight onto the loop
+    }, function () {
+      t.bouncing = false;
+      t.bounceError = true;
+      paintTape();
+    });
+  }
+
+  function tapeToSlicer(i) {
+    var t = state.tapes[i];
+    if (!t || !t.buffer) return;
+    closeTape();
+    openSlicer();
+    // slicerSetTape takes mono 44.1 kHz data — the bounce already is that
+    slicerSetTape(t.buffer.getChannelData(0), t.name);
   }
 
   // ---------------- custom samples ----------------
@@ -748,6 +911,141 @@
     if (sl) sl.root.style.display = "none";
   }
 
+  // ---------------- tape arranger overlay ----------------
+  var tp = null; // lazily built tape overlay handles
+
+  function buildTape() {
+    var root = el("div", "overlay", document.body);
+    root.style.display = "none";
+    var panel = el("div", "editor tape", root);
+    var head = el("div", "ed-head", panel);
+    var title = el("div", "ed-title", head);
+    title.textContent = "TAPE ARRANGER";
+    var x = el("button", "btn ed-x", head);
+    x.textContent = "\u00d7";
+    x.setAttribute("aria-label", "Close tape arranger");
+    x.addEventListener("click", closeTape);
+    root.addEventListener("click", function (e) { if (e.target === root) closeTape(); });
+
+    var bar = el("div", "tp-bar", panel);
+    var barsBtn = el("button", "btn", bar);
+    barsBtn.setAttribute("aria-label", "Bounce length in bars");
+    barsBtn.addEventListener("click", function () {
+      ui.tapeBars = ui.tapeBars >= 4 ? 1 : ui.tapeBars * 2;
+      paintTape();
+    });
+    var playAll = el("button", "btn", bar);
+    playAll.textContent = "\u25b6 ALL";
+    playAll.setAttribute("aria-label", "Play all unmuted tape tracks");
+    playAll.addEventListener("click", tapePlayAll);
+    var stopAll = el("button", "btn", bar);
+    stopAll.textContent = "\u25a0 STOP";
+    stopAll.setAttribute("aria-label", "Stop all tape tracks");
+    stopAll.addEventListener("click", tapeStopAll);
+
+    var tracksEl = el("div", "tp-tracks", panel);
+    var rows = [];
+    for (var i = 0; i < TAPE_COUNT; i++) {
+      (function (ti) {
+        var tr = el("div", "tp-track", tracksEl);
+        var thead = el("div", "tp-thead", tr);
+        var tname = el("div", "tp-tname", thead);
+        var tstatus = el("div", "tp-status", thead);
+        var cv = el("canvas", "tp-wave", tr);
+        cv.width = 560; cv.height = 64;
+        var tops = el("div", "tp-tops", tr);
+        function tbtn(label, fn, aria) {
+          var b = el("button", "btn", tops);
+          b.textContent = label;
+          b.setAttribute("aria-label", aria || label);
+          b.addEventListener("click", function () { fn(ti); });
+          return b;
+        }
+        var bounceBtn = tbtn("BOUNCE", bounceToTape, "Bounce the pattern onto this track");
+        var muteBtn = tbtn("MUTE", tapeToggleMute, "Mute this track");
+        var sliceBtn = tbtn("\u2192SLICER", tapeToSlicer, "Send this track to the tape slicer");
+        var clearBtn = tbtn("CLEAR", tapeClear, "Clear this track");
+        var lvl = makeSlider(tr, "LEVEL", 0, 100, 1, 80,
+          function (v) { return Math.round(v) + "%"; },
+          function (v) { tapeSetLevel(ti, v / 100); });
+        rows.push({ root: tr, name: tname, status: tstatus, canvas: cv,
+                    bounceBtn: bounceBtn, muteBtn: muteBtn, sliceBtn: sliceBtn,
+                    clearBtn: clearBtn, level: lvl });
+      })(i);
+    }
+
+    var hint = el("div", "ed-hint", panel);
+    hint.textContent = "BOUNCE renders the current pattern (swing, choke, mono, filters, delay) to tape and loops it. Tracks loop independently — layer them under the live sequencer. Tapes live in memory until reload.";
+
+    tp = { root: root, title: title, barsBtn: barsBtn, rows: rows };
+    ui.tapeBars = ui.tapeBars || 2;
+    paintTape();
+  }
+
+  function openTape() {
+    if (!tp) buildTape();
+    tp.root.style.display = "flex";
+    paintTape();
+  }
+
+  function closeTape() {
+    if (tp) tp.root.style.display = "none";
+  }
+
+  function tapeDurStr(t) {
+    if (!t.buffer) return "";
+    var sec = t.buffer.duration;
+    return t.bars + (t.bars === 1 ? " bar" : " bars") + " \u00b7 " + t.bpm + " BPM \u00b7 " + sec.toFixed(1) + "s";
+  }
+
+  function paintTape() {
+    if (!tp) return;
+    tp.barsBtn.textContent = "BARS " + (ui.tapeBars || 2);
+    for (var i = 0; i < TAPE_COUNT; i++) {
+      var t = state.tapes[i], r = tp.rows[i];
+      if (!t) continue;
+      r.name.textContent = t.name;
+      r.status.textContent = t.bouncing ? "BOUNCING\u2026" :
+        t.bounceError ? "RENDER FAILED" :
+        t.buffer ? tapeDurStr(t) : "EMPTY";
+      r.root.classList.toggle("playing", !!t._src);
+      r.bounceBtn.textContent = t.bouncing ? "\u2026" : "BOUNCE";
+      r.muteBtn.classList.toggle("on", t.muted);
+      r.sliceBtn.classList.toggle("dim", !t.buffer);
+      r.level.set(t.level * 100);
+    }
+  }
+
+  function drawTapeWave(i) {
+    if (!tp) return;
+    var t = state.tapes[i], cv = tp.rows[i].canvas;
+    var g2d = cv.getContext && cv.getContext("2d");
+    if (!g2d) return;
+    var W = cv.width, H = cv.height;
+    g2d.fillStyle = "#060907";
+    g2d.fillRect(0, 0, W, H);
+    if (!t || !t.buffer) return;
+    var d = t.buffer.getChannelData(0);
+    var mid = H / 2, amp = H * 0.46;
+    g2d.strokeStyle = "#ffb000";
+    g2d.lineWidth = 1;
+    g2d.beginPath();
+    for (var x = 0; x < W; x++) {
+      var a = Math.floor(x / W * d.length);
+      var b = Math.max(a + 1, Math.floor((x + 1) / W * d.length));
+      var mn = 1, mx = -1;
+      for (var k = a; k < b && k < d.length; k++) {
+        var v = d[k];
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+      }
+      if (mx < mn) { mx = 0; mn = 0; }
+      g2d.moveTo(x + 0.5, mid - mx * amp);
+      g2d.lineTo(x + 0.5, mid - mn * amp + 1);
+    }
+    g2d.stroke();
+  }
+
   function syncSlicer() {
     if (!sl) return;
     sl.title.textContent = "TAPE SLICER" + (sl.tapeName ? " — " + sl.tapeName : "");
@@ -1066,6 +1364,12 @@
     ui.sliceBtn.setAttribute("aria-label", "Open the tape slicer");
     ui.sliceBtn.addEventListener("click", openSlicer);
 
+    ui.tapeBtn = el("button", "btn", transport);
+    ui.tapeBtn.textContent = "TAPE";
+    ui.tapeBtn.title = "Bounce the pattern to tape and layer 4 tape tracks";
+    ui.tapeBtn.setAttribute("aria-label", "Open the tape arranger");
+    ui.tapeBtn.addEventListener("click", openTape);
+
     var spec = el("div", "spec", transport);
     spec.innerHTML = "<b>26.04 kHz</b> · <b>12-BIT</b><br>VARISPEED TUNING";
 
@@ -1208,12 +1512,12 @@
     });
 
     var foot = el("div", "foot", app);
-    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; LOAD puts your own samples through the 12-bit path &nbsp;·&nbsp; SLICE chops a long sample across the pads &nbsp;·&nbsp; MONO / CHK voice modes per strip &nbsp;·&nbsp; delay lives in EDIT";
+    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; LOAD puts your own samples through the 12-bit path &nbsp;·&nbsp; SLICE chops a long sample across the pads &nbsp;·&nbsp; MONO / CHK voice modes per strip &nbsp;·&nbsp; delay lives in EDIT &nbsp;·&nbsp; TAPE bounces the pattern to a 4-track loop";
 
     // ---- keyboard ----
     document.addEventListener("keydown", function (e) {
       if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
-      if (e.code === "Escape") { closeEditor(); closeSlicer(); return; }
+      if (e.code === "Escape") { closeEditor(); closeSlicer(); closeTape(); return; }
       if (e.code === "Space") {
         e.preventDefault();
         if (state.playing) stopTransport(); else startTransport();
@@ -1253,6 +1557,7 @@
       });
       state.pattern.push(new Array(STEPS).fill(0));
     });
+    for (var ti = 0; ti < TAPE_COUNT; ti++) state.tapes.push(freshTape(ti));
     load();
     // pattern empty after load? fall back to Boom Bap factory groove
     var any = state.pattern.some(function (row) { return row.some(Boolean); });
@@ -1291,7 +1596,11 @@
     _slicerSetTape: slicerSetTape, _slicerEqual: slicerEqual, _slicerAuto: slicerAuto,
     _slicerSegments: slicerSegments, _auditionSegment: auditionSegment, _sliceToPad: sliceToPad,
     _slicer: function () { return sl; },
-    _editor: function () { return ed; }, _paintChoke: paintChoke, _paintVoiceMode: paintVoiceMode };
+    _editor: function () { return ed; }, _paintChoke: paintChoke, _paintVoiceMode: paintVoiceMode,
+    _openTape: openTape, _closeTape: closeTape, _tape: function () { return tp; },
+    _renderPattern: renderPattern, _bounceToTape: bounceToTape,
+    _tapePlay: tapePlay, _tapeStop: tapeStop, _tapePlayAll: tapePlayAll, _tapeStopAll: tapeStopAll,
+    _tapeToSlicer: tapeToSlicer };
   if (typeof window !== "undefined") window.SP1200 = api;
   else globalThis.SP1200 = api;
 
