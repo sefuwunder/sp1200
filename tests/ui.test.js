@@ -116,10 +116,23 @@ FakeAC.prototype.createDelay = function (max) {
 FakeAC.prototype.createBiquadFilter = function () {
   const f = makeNode();
   f.type = "";
-  f.frequency = { value: 0 };
-  f.Q = { value: 0 };
+  f.frequency = makeParam();
+  f.Q = makeParam();
   this.lastFilter = f;
   return f;
+};
+FakeAC.prototype.createWaveShaper = function () {
+  const w = makeNode();
+  w.curve = null;
+  return w;
+};
+FakeAC.prototype.createOscillator = function () {
+  const o = makeNode();
+  o.type = "sine";
+  o.frequency = makeParam();
+  o.start = function () {};
+  o.stop = function () {};
+  return o;
 };
 FakeAC.prototype.createDynamicsCompressor = function () {
   const c = makeNode();
@@ -220,8 +233,9 @@ ok(ac().lastSource.buffer.sampleRate === 44100, "toggling SP off plays the clean
 ui.spBtn.click();
 
 // ---- per-pad filters ----
+const masterFilt = ac().lastFilter; // the master punch-in FX chain owns a biquad
 SP._playPad(1);
-ok(!ac().lastFilter, "no filter node is created when the filter is off");
+ok(ac().lastFilter === masterFilt, "no filter node is created when the filter is off");
 SP._setFilterType(1, "lowpass");
 ok(ui.padFlt1.textContent === "FLT LP", "FLT button shows the LP type");
 ok(ui.padFlt1.classList.contains("on"), "FLT button lights when the filter is active");
@@ -619,13 +633,70 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
   ok(Math.abs(SP.state.pads[0]._delay.wet.gain.value - SP.state.pads[0].delay.mix) < 1e-9, "delay restores itself on the next hit");
   SP.state.pads[0].delay.on = false;
 
-  // ---- projects: save / load ----
-  ok(ui.projBtn.textContent === "PROJECT", "transport has a PROJECT button");
-  ok(ui.projPanel.style.display === "none", "project panel starts hidden");
-  ui.projBtn.click();
-  ok(ui.projPanel.style.display === "flex", "PROJECT opens the panel");
-  listeners.keydown({ code: "Escape", target: {} });
-  ok(ui.projPanel.style.display === "none", "Escape closes the project panel");
+  // ---- K.O. transport: message LCD + master knob ----
+  ok(!!ui.msgText && typeof ui.msgText.textContent === "string" && ui.msgText.textContent.length > 0, "transport has a message LCD");
+  SP._say("HELLO KO");
+  ok(ui.msgText.textContent === "HELLO KO", "say() posts to the message LCD");
+  ok(!!ui.master && !!ui.master.el, "MASTER is a rotary knob");
+  ui.master.set(64);
+  ok(ui.master.el.getAttribute("aria-valuenow") == 64, "knob reports its value");
+  for (var mi = 0; mi < 8; mi++) {
+    ok(!!ui["padMic" + mi] && ui["padMic" + mi].textContent === "MIC", "pad " + mi + " has a MIC sampling button");
+  }
+
+  // ---- punch-in FX ----
+  ok(ui.fxKeys.length === 6, "six punch-in FX keys");
+  ok(ui.fxKeys[0].children[0].textContent === "FILTER", "first FX key is FILTER");
+  SP._punchFX("filter", true);
+  ok(SP._fxLive().filter === true, "punchFX engages the filter");
+  SP._punchFX("crush", true);
+  ok(SP._fxLive().crush === true, "punchFX engages the crusher");
+  SP._punchFX("filter", false);
+  ok(SP._fxLive().filter === false, "punchFX disengages the filter");
+  // key hold handlers drive the same path
+  var fx0 = ui.fxKeys[2]; // STUTTER
+  fx0._handlers.pointerdown[0]({ preventDefault: function () {} });
+  ok(fx0.classList.contains("live"), "holding an FX key lights it");
+  ok(SP._fxLive().stutter === true, "holding an FX key engages it");
+  ok(ui.msgText.textContent === "FX STUTTER", "FX hold posts to the message LCD");
+  fx0._handlers.pointerup[0]();
+  ok(!fx0.classList.contains("live") && SP._fxLive().stutter === false, "releasing the FX key disengages it");
+  SP._punchFX("drive", true);
+  SP._panic();
+  ok(SP._fxLive().drive === false, "panic releases punched-in FX");
+
+  // ---- KEYS mode ----
+  ok(SP._keysMode().every(function (k) { return k === false; }), "all rows start in step mode");
+  SP._toggleKeys(2);
+  ok(SP._keysMode()[2] === true, "row 2 enters KEYS mode");
+  ok(ui.seqRows[2].children[0].classList.contains("keys-mode"), "KEYS tag shows on the row label");
+  ok(ui.stepBtns[2][0].textContent === "-8" && ui.stepBtns[2][8].textContent === "0" &&
+     ui.stepBtns[2][15].textContent === "+7", "keys relabel to -8..+7 semitones");
+  ok(ui.stepBtns[2][8].classList.contains("root"), "the root key is marked");
+  ok(ui.msgText.textContent === "KEYS CLAP", "KEYS mode posts to the message LCD");
+  var kv = SP.state.pads[2]._voices.length;
+  ui.stepBtns[2][11].click(); // +3 semitones
+  ok(SP.state.pads[2]._voices.length === kv + 1, "a key in KEYS mode triggers the voice");
+  ok(SP.state.pattern[2][11] === 0, "KEYS presses do not edit the pattern");
+  SP._toggleKeys(2);
+  ok(SP._keysMode()[2] === false, "row 2 leaves KEYS mode");
+  ok(ui.stepBtns[2][0].textContent === "1" && ui.stepBtns[2][15].textContent === "16", "step numerals restore");
+  ok(ui.msgText.textContent === "STEPS CLAP", "leaving KEYS mode posts to the message LCD");
+
+  // ---- mic sampling ----
+  SP._sampleMic(0, ui["padMic0"]);
+  ok(ui.msgText.textContent === "NO MIC INPUT", "mic without hardware reports NO MIC INPUT");
+
+  // ---- projects: 9 slots ----
+  ok(ui.projKeys.length === 9, "nine project slot keys");
+  ok(ui.projKeys[0].children[1].textContent === "1", "slot keys are numbered 1-9");
+  SP._loadSlot(0);
+  ok(SP.state.bpm === 92, "slot 1 loads the Boom Bap factory groove");
+  ok(SP._currentSlot() === 0, "factory load marks the current slot");
+  ok(ui.projKeys[0].classList.contains("current"), "current slot key is highlighted");
+  SP._loadSlot(5);
+  ok(ui.projMsg.textContent === "SLOT 6 EMPTY", "empty slot reports EMPTY");
+  ok(SP.state.bpm === 92, "empty slot load leaves state untouched");
 
   // pcm16 base64 round-trip
   const rt = new Float32Array([0, 0.5, -0.5, 1, -1, 0.123456, -0.987654]);
@@ -647,35 +718,36 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
   sp1.customName = "MYSMPL";
   SP._bounceToTape(0);
   await new Promise(function (r) { setTimeout(r, 60); });
-  ok(!!(SP.state.tapes[0] && SP.state.tapes[0].buffer), "track 1 has audio before the project save");
+  ok(!!(SP.state.tapes[0] && SP.state.tapes[0].buffer), "track 1 has audio before the slot store");
   const tapeLen = SP.state.tapes[0].buffer.length;
-  SP._saveProject("projtest");
-  ok(!!SP._listProjects().projtest, "saved project appears in the index");
-  ok(ui.projStatus.textContent.indexOf("projtest") >= 0, "save reports its status");
+  SP._storeSlot(3);
+  ok(SP._slotHas(3), "stored slot reports filled");
+  ok(ui.projKeys[3].classList.contains("filled"), "filled slot key shows its dot");
+  ok(ui.projMsg.textContent === "STORED -> SLOT 4", "store reports its slot");
 
-  // mutate everything, then load
+  // mutate everything, then load the slot
   SP.state.bpm = 60; SP.state.swing = 50; SP.state.master = 80; SP.state.spMode = true;
   SP.state.pattern.forEach(function (row) { row.fill(0); });
   sp0.tune = 1; sp0.muted = false; sp0.filterType = "off"; sp0.voiceMode = "poly"; sp0.delay.on = false;
   sp1.dataClean = new Float32Array([0]); sp1.customName = null;
   SP._tapeStopAll();
   SP.state.tapes[0].buffer = null;
-  SP._loadProject("projtest");
-  ok(SP.state.bpm === 100, "project load restores bpm");
-  ok(SP.state.swing === 70 && SP.state.master === 64 && SP.state.spMode === false, "project load restores transport scalars");
-  ok(SP.state.pattern[3][5] === 1 && SP.state.pattern[7][15] === 1 && SP.state.pattern[0][0] === 0, "project load restores the pattern");
+  SP._loadSlot(3);
+  ok(SP.state.bpm === 100, "slot load restores bpm");
+  ok(SP.state.swing === 70 && SP.state.master === 64 && SP.state.spMode === false, "slot load restores transport scalars");
+  ok(SP.state.pattern[3][5] === 1 && SP.state.pattern[7][15] === 1 && SP.state.pattern[0][0] === 0, "slot load restores the pattern");
   const q0 = SP.state.pads[0];
   ok(Math.abs(q0.tune - 1.5) < 1e-9 && q0.muted === true && q0.filterType === "lowpass" &&
-     q0.filterFreq === 800 && q0.filterQ === 2, "project load restores pad strip settings");
-  ok(q0.voiceMode === "mono" && q0.choke === 2, "project load restores voice mode + choke");
+     q0.filterFreq === 800 && q0.filterQ === 2, "slot load restores pad strip settings");
+  ok(q0.voiceMode === "mono" && q0.choke === 2, "slot load restores voice mode + choke");
   ok(q0.delay.on === true && Math.abs(q0.delay.time - 0.5) < 1e-9 &&
-     Math.abs(q0.delay.feedback - 0.6) < 1e-9 && Math.abs(q0.delay.mix - 0.45) < 1e-9, "project load restores delay settings");
+     Math.abs(q0.delay.feedback - 0.6) < 1e-9 && Math.abs(q0.delay.mix - 0.45) < 1e-9, "slot load restores delay settings");
   const q1 = SP.state.pads[1];
-  ok(q1.customName === "MYSMPL", "project load restores the custom sample name");
-  ok(q1.dataClean.length === 5 && Math.abs(q1.dataClean[4] - 0.5) < 1 / 32767, "project load restores custom sample data");
-  ok(!!q1.dataSP && q1.dataSP.length > 0, "project load re-runs the SP conversion on the custom sample");
+  ok(q1.customName === "MYSMPL", "slot load restores the custom sample name");
+  ok(q1.dataClean.length === 5 && Math.abs(q1.dataClean[4] - 0.5) < 1 / 32767, "slot load restores custom sample data");
+  ok(!!q1.dataSP && q1.dataSP.length > 0, "slot load re-runs the SP conversion on the custom sample");
   const qt = SP.state.tapes[0];
-  ok(!!(qt.buffer && qt.buffer.getChannelData(0).length === tapeLen), "project load restores tape audio");
+  ok(!!(qt.buffer && qt.buffer.getChannelData(0).length === tapeLen), "slot load restores tape audio");
   // UI follows the loaded state
   ok(ui.stepBtns[3][5].classList.contains("on") && ui.stepBtns[7][15].classList.contains("on"), "loaded pattern shows on the grid");
   ok(!ui.stepBtns[0][0].classList.contains("on"), "cleared steps stay off on the grid");
@@ -686,23 +758,27 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
   SP._playPad(0);
   SP._tapePlay(0);
   ok(SP._anyTapePlaying(), "tape playing before the load-silence check");
-  SP._loadProject("projtest");
-  ok(!SP._anyTapePlaying(), "project load stops tape playback");
-  ok(SP.state.pads[0]._voices.length === 0, "project load clears pad voices");
+  SP._loadSlot(3);
+  ok(!SP._anyTapePlaying(), "slot load stops tape playback");
+  ok(SP.state.pads[0]._voices.length === 0, "slot load clears pad voices");
 
-  // list + delete
-  SP._saveProject("second");
-  ok(!!SP._listProjects().projtest && !!SP._listProjects().second, "index lists both saves");
-  ui.projList.children.length = 0; // stub: innerHTML="" doesn't drop stub children
-  SP._paintProjects();
-  ok(ui.projList.children.length === 2, "panel lists two projects");
-  SP._deleteProject("second");
-  ok(!SP._listProjects().second && !!SP._listProjects().projtest, "delete removes one project");
-  ui.projList.children.length = 0;
-  SP._paintProjects();
-  ok(ui.projList.children.length === 1, "panel list updates after delete");
-  SP._deleteProject("projtest");
-  ok(Object.keys(SP._listProjects()).length === 0, "index empty after cleanup");
+  // factory slots are locked
+  SP._storeSlot(0);
+  ok(!SP._slotHas(0), "factory slot refuses the store");
+  ok(ui.projMsg.textContent === "FACTORY LOCKED", "factory store reports LOCKED");
+  SP._loadSlot(1);
+  ok(SP.state.bpm === 140, "slot 2 loads the Trap factory groove");
+
+  // STORE arm + slot key click
+  ui.storeBtn.click();
+  ok(ui.storeBtn.classList.contains("armed"), "STORE arms");
+  SP.state.bpm = 111;
+  ui.projKeys[4].click();
+  ok(SP._slotHas(4), "STORE + slot key saves the state");
+  ok(!ui.storeBtn.classList.contains("armed"), "store disarms after saving");
+  SP.state.bpm = 60;
+  ui.projKeys[4].click();
+  ok(SP.state.bpm === 111, "slot key tap loads the saved state");
 
   // ---- external save / load: project files ----
   ok(SP._projectFileName("My Beat!") === "my-beat.sp1200.json", "export filename is sanitized");
@@ -711,37 +787,32 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
   SP.state.bpm = 97;
   SP.state.pattern.forEach(function (row) { row.fill(0); });
   SP.state.pattern[2][7] = 1;
-  ui.projName.value = "My Beat!";
   SP._exportProject();
   ok(dlCapture.urlMade === true, "export creates a download");
   ok(dlCapture.type === "application/json", "export is typed as JSON");
   const exported = JSON.parse(dlCapture.parts[0]);
-  ok(exported.name === "My Beat!" && exported.version === 1, "exported payload carries name + version");
+  ok(exported.version === 1, "exported payload carries the version");
   ok(exported.bpm === 97 && exported.pattern[2][7] === 1, "exported payload carries the project state");
-  ok(ui.projStatus.textContent.indexOf("Exported") >= 0, "export reports its status");
+  ok(ui.projMsg.textContent.indexOf("EXPORTED") === 0, "export reports its status");
   // mutate, then import the file back
   SP.state.bpm = 60;
   SP.state.pattern.forEach(function (row) { row.fill(0); });
-  SP._importProjectFile({ _text: dlCapture.parts[0], name: "my-beat.sp1200.json" });
+  SP._importProjectFile({ _text: dlCapture.parts[0], name: "slot-5.sp1200.json" });
   ok(SP.state.bpm === 97, "import restores bpm from the file");
   ok(SP.state.pattern[2][7] === 1 && SP.state.pattern[0][0] === 0, "import restores the pattern from the file");
   ok(ui.stepBtns[2][7].classList.contains("on"), "imported pattern shows on the grid");
-  ok(!!SP._listProjects()["My Beat!"], "imported project joins the saved list");
-  ok(ui.projStatus.textContent.indexOf("Imported") >= 0, "import reports its status");
+  ok(ui.projMsg.textContent.indexOf("IMPORTED") === 0, "import reports its status");
   // corrupt file
   SP._importProjectFile({ _text: "{nope", name: "bad.json" });
-  ok(ui.projStatus.textContent.indexOf("not a valid project file") >= 0, "corrupt import is rejected cleanly");
+  ok(ui.projMsg.textContent === "IMPORT FAILED - BAD FILE", "corrupt import is rejected cleanly");
   ok(SP.state.bpm === 97, "failed import leaves state untouched");
   // IMPORT button opens the file picker
   var pickerOpened = false;
   ui.projFile.click = function () { pickerOpened = true; };
-  var xrow = ui.projPanel.children.filter(function (c) { return c.className === "proj-row"; })[1];
-  var impBtn = xrow.children.filter(function (c) { return c.textContent === "IMPORT"; })[0];
-  ok(!!impBtn, "IMPORT button exists in the panel");
+  var impBtn = ui.importBtn;
+  ok(!!impBtn && impBtn.textContent === "IMPORT", "IMPORT button exists in the projects module");
   impBtn.click();
   ok(pickerOpened, "IMPORT opens the file picker");
-  SP._deleteProject("My Beat!");
-  ok(Object.keys(SP._listProjects()).length === 0, "index empty at the end");
 
   console.log("\nui: " + n + " passed");
 })().catch(function (e) { console.error("TAPE TESTS FAILED:", e); process.exit(1); });

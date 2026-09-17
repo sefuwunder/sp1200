@@ -71,6 +71,7 @@
 
   var ui = {};      // element handles, filled by buildUI()
   var ctx = null, masterGain = null;
+  var keysMode = [];  // per-row: false = step composer, true = chromatic KEYS
 
   var FILTER_TYPES = ["off", "lowpass", "bandpass", "highpass"];
   var FILTER_SHORT = { off: "OFF", lowpass: "LP", bandpass: "BP", highpass: "HP" };
@@ -86,6 +87,21 @@
     return e;
   }
   function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+
+  // ---- K.O.-style message LCD: terse feedback for every action ----
+  var sayTimer = null;
+  function defaultMsg() {
+    return (state.playing ? "PLAYING " : "READY ") + state.bpm + " BPM";
+  }
+  function say(msg, sticky) {
+    if (ui.msgText) ui.msgText.textContent = msg;
+    if (sayTimer) { clearTimeout(sayTimer); sayTimer = null; }
+    if (!sticky && ui.msgText) {
+      sayTimer = setTimeout(function () {
+        if (ui.msgText) ui.msgText.textContent = defaultMsg();
+      }, 2400);
+    }
+  }
 
   // ---- compact binary <-> text helpers (pure JS, no btoa dependency) ----
   var B64ABC = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -208,6 +224,104 @@
   }
 
   // ---------------- audio ----------------
+  var FX = null;       // master punch-in FX node set, built lazily
+  var fxLive = {};     // fx name -> true while punched in
+
+  function linearCurve() {
+    var c = new Float32Array(256), i;
+    for (i = 0; i < 256; i++) c[i] = i / 128 - 1;
+    return c;
+  }
+  function crushCurve(bits) {
+    var c = new Float32Array(256), i, steps = Math.pow(2, bits) - 1;
+    for (i = 0; i < 256; i++) {
+      var v = i / 128 - 1;
+      c[i] = Math.round(v * steps) / steps;
+    }
+    return c;
+  }
+  function driveCurve() {
+    var c = new Float32Array(256), i;
+    for (i = 0; i < 256; i++) {
+      var v = (i / 128 - 1) * 2.4;
+      c[i] = Math.tanh(v) * 0.82;
+    }
+    return c;
+  }
+
+  // Master punch-in FX chain, K.O. style: every effect sits bypassed in
+  // series and is engaged momentarily while its key is held.
+  function buildMasterFX(ac, input, out) {
+    if (FX && FX.ac === ac) return FX.out;
+    var filt = ac.createBiquadFilter();
+    filt.type = "lowpass"; filt.frequency.value = 19000; filt.Q.value = 0.7;
+    var crush = ac.createWaveShaper(); crush.curve = linearCurve();
+    var drivePre = ac.createGain(); drivePre.gain.value = 1;
+    var drive = ac.createWaveShaper(); drive.curve = linearCurve();
+    var stut = ac.createGain(); stut.gain.value = 1;
+    input.connect(filt); filt.connect(crush); crush.connect(drivePre);
+    drivePre.connect(drive); drive.connect(stut);
+    // chorus send (parallel)
+    var chD = ac.createDelay(0.05); chD.delayTime.value = 0.016;
+    var chWet = ac.createGain(); chWet.gain.value = 0;
+    stut.connect(chD); chD.connect(chWet); chWet.connect(out);
+    // slapback send (parallel)
+    var dl = ac.createDelay(1.0); dl.delayTime.value = 0.29;
+    var dlFb = ac.createGain(); dlFb.gain.value = 0.38;
+    var dlWet = ac.createGain(); dlWet.gain.value = 0;
+    dl.connect(dlFb); dlFb.connect(dl); dl.connect(dlWet); dlWet.connect(out);
+    stut.connect(dl);
+    stut.connect(out);
+    // gentle chorus wobble, always running but inaudible until wet opens
+    try {
+      var lfo = ac.createOscillator(); lfo.type = "sine"; lfo.frequency.value = 1.4;
+      var lfoG = ac.createGain(); lfoG.gain.value = 0.004;
+      lfo.connect(lfoG); lfoG.connect(chD.delayTime); lfo.start();
+    } catch (e) {}
+    FX = { ac: ac, out: out, filt: filt, crush: crush, drivePre: drivePre,
+      drive: drive, stut: stut, chWet: chWet, dlWet: dlWet, stutOsc: null };
+    return out;
+  }
+
+  function stutterOn(on) {
+    var t = ctx.currentTime;
+    if (on) {
+      try {
+        var o = ctx.createOscillator(); o.type = "square";
+        o.frequency.value = state.bpm / 60 * 4; // 16th-note chop
+        var og = ctx.createGain(); og.gain.value = 0.5;
+        o.connect(og); og.connect(FX.stut.gain); o.start(t);
+        FX.stutOsc = o;
+      } catch (e) {}
+      FX.stut.gain.setTargetAtTime(0.5, t, 0.01);
+    } else {
+      if (FX.stutOsc) { try { FX.stutOsc.stop(t + 0.05); } catch (e) {} FX.stutOsc = null; }
+      FX.stut.gain.setTargetAtTime(1, t, 0.02);
+    }
+  }
+
+  // Engage/disengage one punch-in effect. Safe to call before audio init.
+  function punchFX(name, on) {
+    if (!FX) { fxLive[name] = on; return; }
+    var t = ctx.currentTime;
+    fxLive[name] = on;
+    if (name === "filter") FX.filt.frequency.setTargetAtTime(on ? 620 : 19000, t, 0.03);
+    else if (name === "crush") { try { FX.crush.curve = on ? crushCurve(4) : linearCurve(); } catch (e) {} }
+    else if (name === "drive") {
+      try { FX.drive.curve = on ? driveCurve() : linearCurve(); } catch (e) {}
+      FX.drivePre.gain.setTargetAtTime(on ? 2.1 : 1, t, 0.02);
+    }
+    else if (name === "stutter") stutterOn(on);
+    else if (name === "chorus") FX.chWet.gain.setTargetAtTime(on ? 0.38 : 0, t, 0.05);
+    else if (name === "delay") FX.dlWet.gain.setTargetAtTime(on ? 0.3 : 0, t, 0.05);
+  }
+  function allFXOff() {
+    ["filter", "crush", "stutter", "drive", "chorus", "delay"].forEach(function (n) {
+      if (fxLive[n]) punchFX(n, false);
+    });
+    if (ui.fxKeys) ui.fxKeys.forEach(function (k) { k.classList.remove("live"); });
+  }
+
   function ensureAudio() {
     if (ctx) {
       if (ctx.state === "suspended" && ctx.resume) ctx.resume();
@@ -220,8 +334,12 @@
     var comp = ctx.createDynamicsCompressor();
     comp.threshold.value = -18;
     comp.ratio.value = 4;
-    masterGain.connect(comp);
+    // the punch-in chain is the ONLY path to the compressor: no dry bypass,
+    // so engaged FX fully own the master bus (KO II punch-in semantics)
+    buildMasterFX(ctx, masterGain, comp);
     comp.connect(ctx.destination);
+    // re-apply any punch-in state requested before init
+    Object.keys(fxLive).forEach(function (n) { if (fxLive[n]) punchFX(n, true); });
     return ctx;
   }
 
@@ -296,7 +414,7 @@
   // Generic pad trigger on any BaseAudioContext. VS is an array of voice
   // stores (one per pad); the live path passes liveVS(), the bounce render
   // passes fresh stores on an OfflineAudioContext.
-  function playPadOn(ac, dest, idx, t0, VS) {
+  function playPadOn(ac, dest, idx, t0, VS, rateMul) {
     var p = state.pads[idx];
     if (!p || p.muted) return null;
     // Choke groups: a hit cuts every other pad sharing its group.
@@ -314,7 +432,7 @@
     buf.copyToChannel(data, 0);
     var src = ac.createBufferSource();
     src.buffer = buf;
-    src.playbackRate.value = p.tune; // varispeed, exactly like the hardware
+    src.playbackRate.value = p.tune * (rateMul || 1); // varispeed, exactly like the hardware
     var g = ac.createGain();
     g.gain.value = p.level;
     if (p.filterType !== "off") {
@@ -343,11 +461,11 @@
     return voice;
   }
 
-  function playPad(idx, when) {
+  function playPad(idx, when, rateMul) {
     var p = state.pads[idx];
     if (!p || p.muted) return;
     ensureAudio();
-    playPadOn(ctx, masterGain, idx, when == null ? ctx.currentTime : when, liveVS());
+    playPadOn(ctx, masterGain, idx, when == null ? ctx.currentTime : when, liveVS(), rateMul);
     flashPad(idx);
   }
 
@@ -390,11 +508,13 @@
     startTransport();
     tapePlayAll();
     paintTransport();
+    say("PLAYING");
   }
   function globalStop() {
     stopTransport();
     tapeStopAll();
     paintTransport();
+    say("STOPPED");
   }
   // Panic: silence every voice, delay tail, tape, and the sequencer, now.
   function panic() {
@@ -403,6 +523,7 @@
     stopTransport();
     tapeStopAll();
     stopSlicerAudition();
+    allFXOff();
     var VS = liveVS();
     for (var i = 0; i < state.pads.length; i++) {
       killStoreVoices(VS[i], t);
@@ -570,15 +691,6 @@
     slicerSetTape(t.buffer.getChannelData(0), t.name);
   }
 
-  // ---------------- projects: named save / load ----------------
-  var PROJECTS_KEY = "sp1200.projects";
-  function loadProjectIndex() {
-    try { return JSON.parse(localStorage.getItem(PROJECTS_KEY) || "{}") || {}; }
-    catch (e) { return {}; }
-  }
-  function writeProjectIndex(idx) {
-    localStorage.setItem(PROJECTS_KEY, JSON.stringify(idx));
-  }
   function tapeToSaved(t) {
     var o = { name: t.name, bars: t.bars, bpm: t.bpm, level: t.level, muted: t.muted, audio: null };
     if (t.buffer && t.buffer.length) {
@@ -609,31 +721,74 @@
       tapeBars: ui.tapeBars || 2,
     };
   }
-  function saveProject(name) {
-    name = (name || "").trim().slice(0, 40);
-    if (!name) { projStatus("Name the project first"); return; }
-    var idx = loadProjectIndex();
-    var proj = serializeProject(name);
+  // ---------------- projects: 9 K.O. slots ----------------
+  var FACTORY_SLOTS = ["Boom Bap", "Trap", "House"];
+  var storeArmed = false;
+  var currentSlot = -1; // last loaded slot, -1 = none
+  function slotLSKey(i) { return "sp1200.slot." + i; }
+  function projMsg(m) {
+    if (ui.projMsg) ui.projMsg.textContent = m || "";
+    if (m) say(m);
+  }
+  function slotHas(i) {
     try {
-      idx[name] = proj;
-      writeProjectIndex(idx);
-      projStatus("Saved \u201c" + name + "\u201d");
+      var raw = localStorage.getItem(slotLSKey(i));
+      if (!raw) return false;
+      var p = JSON.parse(raw);
+      return !!(p && p.version === 1 && Array.isArray(p.pattern));
+    } catch (e) { return false; }
+  }
+  function paintSlots() {
+    if (!ui.projKeys) return;
+    for (var i = 0; i < 9; i++) {
+      var b = ui.projKeys[i];
+      b.classList.toggle("filled", i >= 3 ? slotHas(i) : true);
+      b.classList.toggle("current", i === currentSlot);
+      var lab = b.children[2];
+      if (lab && i >= 3) lab.textContent = slotHas(i) ? "USER" : "EMPTY";
+    }
+  }
+  function loadSlot(i) {
+    if (i < 3) {
+      applyPreset(FACTORY_SLOTS[i]);
+      currentSlot = i;
+      paintSlots();
+      projMsg("FACTORY " + FACTORY_SLOTS[i].toUpperCase());
+      return;
+    }
+    var raw = null;
+    try { raw = localStorage.getItem(slotLSKey(i)); } catch (e) {}
+    if (!raw) { projMsg("SLOT " + (i + 1) + " EMPTY"); return; }
+    var proj = null;
+    try { proj = JSON.parse(raw); } catch (e) {}
+    if (!proj || proj.version !== 1) { projMsg("SLOT " + (i + 1) + " CORRUPT"); return; }
+    loadProjectData(proj);
+    currentSlot = i;
+    paintSlots();
+    projMsg("SLOT " + (i + 1) + " LOADED");
+  }
+  function storeSlot(i) {
+    storeArmed = false;
+    if (ui.storeBtn) ui.storeBtn.classList.remove("armed");
+    if (i < 3) { projMsg("FACTORY LOCKED"); return; }
+    var proj = serializeProject("SLOT " + (i + 1));
+    try {
+      localStorage.setItem(slotLSKey(i), JSON.stringify(proj));
+      currentSlot = i;
+      paintSlots();
+      projMsg("STORED -> SLOT " + (i + 1));
+      save();
     } catch (e) {
       // quota: retry without tape audio, which dominates the size
       try {
         proj.tapes.forEach(function (t) { t.audio = null; });
         proj.tapesDropped = true;
-        idx[name] = proj;
-        writeProjectIndex(idx);
-        projStatus("Saved \u201c" + name + "\u201d (tape audio too large \u2014 skipped)");
-      } catch (e2) { projStatus("Save failed: storage is full"); }
+        localStorage.setItem(slotLSKey(i), JSON.stringify(proj));
+        currentSlot = i;
+        paintSlots();
+        projMsg("STORED -> SLOT " + (i + 1) + " (NO TAPE)");
+      } catch (e2) { projMsg("SLOT FULL - STORAGE FULL"); }
     }
-    paintProjects();
-  }
-  function loadProject(name) {
-    var proj = loadProjectIndex()[name];
-    if (!proj || proj.version !== 1) { projStatus("Can't load \u201c" + name + "\u201d"); return; }
-    loadProjectData(proj);
   }
   function loadProjectData(proj) {
     panic();
@@ -671,14 +826,6 @@
     ui.tapeBars = proj.tapeBars || 2;
     syncUIFromState();
     save(); // the autosave follows the loaded project
-    closeProjPanel();
-  }
-  function deleteProject(name) {
-    var idx = loadProjectIndex();
-    delete idx[name];
-    try { writeProjectIndex(idx); } catch (e) {}
-    paintProjects();
-    projStatus("Deleted \u201c" + name + "\u201d");
   }
   function newProject() {
     if (!window.confirm("Start a new project? Unsaved changes will be lost.")) return;
@@ -707,104 +854,54 @@
     } catch (e) { return false; }
   }
   function exportProject() {
-    var name = (ui.projName && ui.projName.value || "").trim().slice(0, 40) || "untitled";
+    var name = currentSlot >= 0 ? "slot-" + (currentSlot + 1) : "untitled";
     var text = JSON.stringify(serializeProject(name));
     if (downloadFile(projectFileName(name), text, "application/json")) {
-      projStatus("Exported \u201c" + name + "\u201d");
+      projMsg("EXPORTED " + projectFileName(name).toUpperCase());
     } else {
-      projStatus("Export needs a full browser");
+      projMsg("EXPORT NEEDS A FULL BROWSER");
     }
   }
   function importProjectFile(file) {
-    if (typeof FileReader === "undefined") { projStatus("Import needs a full browser"); return; }
+    if (typeof FileReader === "undefined") { projMsg("IMPORT NEEDS A FULL BROWSER"); return; }
     var rd = new FileReader();
     rd.onload = function () {
       var proj;
       try {
         proj = JSON.parse(rd.result);
         if (!proj || proj.version !== 1 || !Array.isArray(proj.pattern)) throw 0;
-      } catch (e) { projStatus("Import failed: not a valid project file"); return; }
-      var name = (proj.name || "imported").toString().slice(0, 40) || "imported";
-      proj.name = name;
-      try {
-        var idx = loadProjectIndex();
-        idx[name] = proj;
-        writeProjectIndex(idx);
-      } catch (e) { /* quota: load it anyway, just don't keep it listed */ }
+      } catch (e) { projMsg("IMPORT FAILED - BAD FILE"); return; }
       loadProjectData(proj);
-      paintProjects();
-      projStatus("Imported \u201c" + name + "\u201d");
+      currentSlot = -1;
+      paintSlots();
+      projMsg("IMPORTED " + String(proj.name || "PROJECT").toUpperCase().slice(0, 18));
     };
-    try { rd.readAsText(file); } catch (e) { projStatus("Import failed: can't read the file"); }
-  }
-  function projStatus(msg) {
-    if (ui.projStatus) ui.projStatus.textContent = msg || "";
-  }
-  function toggleProjPanel() {
-    if (!ui.projPanel) return;
-    var open = ui.projPanel.style.display !== "none";
-    if (open) closeProjPanel();
-    else {
-      ui.projPanel.style.display = "flex";
-      paintProjects();
-      projStatus("");
-      if (ui.projName && ui.projName.focus) ui.projName.focus();
-    }
-  }
-  function closeProjPanel() {
-    if (ui.projPanel) ui.projPanel.style.display = "none";
-  }
-  function paintProjects() {
-    if (!ui.projList) return;
-    var idx = loadProjectIndex();
-    var names = Object.keys(idx).sort();
-    ui.projList.innerHTML = "";
-    if (!names.length) {
-      var empty = el("div", "proj-empty", ui.projList);
-      empty.textContent = "NO SAVED PROJECTS";
-      return;
-    }
-    names.forEach(function (name) {
-      var item = el("div", "proj-item", ui.projList);
-      var nm = el("div", "nm", item);
-      nm.textContent = name;
-      nm.title = name;
-      var dt = el("div", "dt", item);
-      var when = idx[name] && idx[name].savedAt;
-      dt.textContent = when ? new Date(when).toLocaleDateString() : "";
-      var loadB = el("button", "btn", item);
-      loadB.textContent = "LOAD";
-      loadB.setAttribute("aria-label", "Load project " + name);
-      loadB.addEventListener("click", function () { loadProject(name); });
-      var delB = el("button", "btn", item);
-      delB.textContent = "DEL";
-      delB.setAttribute("aria-label", "Delete project " + name);
-      delB.addEventListener("click", function () {
-        if (window.confirm("Delete project \u201c" + name + "\u201d?")) deleteProject(name);
-      });
-    });
+    try { rd.readAsText(file); } catch (e) { projMsg("IMPORT FAILED - UNREADABLE"); }
   }
 
   // ---------------- custom samples ----------------
+  // Put raw mono float samples through the SP path onto a pad.
+  function assignSampleToPad(padIdx, ch, sampleRate, name) {
+    var p = state.pads[padIdx];
+    var sp = DSP.resampleLinear(ch, sampleRate, DSP.SP_RATE);
+    DSP.normalize(sp, 0.92);
+    p.dataSP = DSP.quantize12(sp);
+    var clean = DSP.resampleLinear(ch, sampleRate, DSP.SYNTH_RATE);
+    p.dataClean = DSP.normalize(clean, 0.92);
+    p.customName = (name || "sample").replace(/\.\w+$/, "").slice(0, 12).toUpperCase();
+    ui.padNames[padIdx].textContent = p.customName;
+    p._undo = null;
+    p.selStart = 0; p.selEnd = 1;
+    if (ui.edOpenFor === padIdx) syncEditor();
+    playPad(padIdx);
+    save();
+  }
   function loadSampleFile(padIdx, file) {
     ensureAudio();
     var rd = new FileReader();
     rd.onload = function () {
       var done = function (audioBuf) {
-        var ch = audioBuf.getChannelData(0);
-        var p = state.pads[padIdx];
-        var sp = DSP.resampleLinear(ch, audioBuf.sampleRate, DSP.SP_RATE);
-        DSP.normalize(sp, 0.92);
-        p.dataSP = DSP.quantize12(sp);
-        var clean = DSP.resampleLinear(ch, audioBuf.sampleRate, DSP.SYNTH_RATE);
-        p.dataClean = DSP.normalize(clean, 0.92);
-        p.customName = (file.name || "sample").replace(/\.\w+$/, "").slice(0, 12).toUpperCase();
-        ui.padNames[padIdx].textContent = p.customName;
-        p._undo = null;
-        p.selStart = 0; p.selEnd = 1;
-        if (ui.edOpenFor === padIdx) syncEditor();
-        playPad(padIdx);
-        save();
+        assignSampleToPad(padIdx, audioBuf.getChannelData(0), audioBuf.sampleRate, file.name);
       };
       try {
         var r = ctx.decodeAudioData(rd.result);
@@ -813,6 +910,65 @@
       } catch (e) { /* unreadable file */ }
     };
     rd.readAsArrayBuffer(file);
+  }
+
+  // ---- K.O.-style mic sampling: hold the room, drop it on a pad ----
+  var micSession = null;
+  function cleanupMicStream(stream) {
+    try {
+      (stream.getTracks ? stream.getTracks() : []).forEach(function (tr) { try { tr.stop(); } catch (e) {} });
+    } catch (e) {}
+  }
+  function sampleMic(padIdx, btn) {
+    ensureAudio();
+    var nav = (typeof navigator !== "undefined") ? navigator : null;
+    if (!nav || !nav.mediaDevices || !nav.mediaDevices.getUserMedia) { say("NO MIC INPUT"); return; }
+    if (micSession) { stopMicCapture(); return; } // tap again to stop early
+    var g = nav.mediaDevices.getUserMedia({ audio: true });
+    var onStream = function (stream) {
+      var MR = (typeof window !== "undefined" && window.MediaRecorder) || globalThis.MediaRecorder;
+      var rec;
+      try { rec = new MR(stream); } catch (e) { say("MIC FAILED"); cleanupMicStream(stream); return; }
+      micSession = { stream: stream, rec: rec, pad: padIdx, btn: btn, chunks: [] };
+      rec.ondataavailable = function (e) { if (e.data && e.data.size) micSession.chunks.push(e.data); };
+      rec.onstop = function () { finishMicCapture(); };
+      btn.classList.add("mic-live");
+      say("MIC LIVE - TAP TO STOP", true);
+      try { rec.start(); } catch (e) { finishMicCapture(); return; }
+      micSession.timer = setTimeout(stopMicCapture, 4000); // max 4 s, K.O.-style
+    };
+    if (g && g.then) g.then(onStream, function () { say("MIC DENIED"); });
+  }
+  function stopMicCapture() {
+    if (!micSession) return;
+    clearTimeout(micSession.timer);
+    if (micSession.btn) micSession.btn.classList.remove("mic-live");
+    try { micSession.rec.stop(); } catch (e) { finishMicCapture(); }
+  }
+  function finishMicCapture() {
+    var ms = micSession; micSession = null;
+    if (ms && ms.btn) ms.btn.classList.remove("mic-live");
+    if (!ms || !ms.chunks.length) {
+      if (ms) cleanupMicStream(ms.stream);
+      say("MIC EMPTY");
+      return;
+    }
+    var stream = ms.stream, pad = ms.pad;
+    var blob = new Blob(ms.chunks, { type: (ms.rec && ms.rec.mimeType) || "audio/webm" });
+    cleanupMicStream(stream);
+    var done = function (ab) {
+      var dec = function (buf) {
+        assignSampleToPad(pad, buf.getChannelData(0), buf.sampleRate, "mic");
+        say("MIC -> " + PAD_DEFS[pad].name);
+      };
+      try {
+        var r = ctx.decodeAudioData(ab);
+        if (r && r.then) r.then(dec, function () { say("MIC DECODE ERR"); });
+        else ctx.decodeAudioData(ab, dec, function () { say("MIC DECODE ERR"); });
+      } catch (e) { say("MIC DECODE ERR"); }
+    };
+    if (blob.arrayBuffer) blob.arrayBuffer().then(done, function () { say("MIC READ ERR"); });
+    else say("MIC READ ERR");
   }
   function resetPad(padIdx) {
     var p = state.pads[padIdx];
@@ -1044,7 +1200,6 @@
     drawWave();
   }
   function openEditor(i) {
-    closeProjPanel();
     if (!ed) buildEditor();
     ui.edOpenFor = i;
     var p = state.pads[i];
@@ -1245,7 +1400,6 @@
   }
 
   function openSlicer() {
-    closeProjPanel();
     if (!sl) buildSlicer();
     syncSlicer();
     sl.root.style.display = "flex";
@@ -1326,7 +1480,6 @@
   }
 
   function openTape() {
-    closeProjPanel();
     if (!tp) buildTape();
     tp.root.style.display = "flex";
     paintTape();
@@ -1723,6 +1876,35 @@
     if (ui.koStepNum) ui.koStepNum.textContent = (step < 9 ? "0" : "") + (step + 1);
     if (ui.koLcd) ui.koLcd.classList.add("playing");
   }
+  // ---- KEYS mode: a composer row becomes a chromatic keyboard ----
+  function toggleKeysMode(i) {
+    keysMode[i] = !keysMode[i];
+    paintKeysRow(i);
+    say(keysMode[i] ? "KEYS " + PAD_DEFS[i].name : "STEPS " + PAD_DEFS[i].name);
+  }
+  function paintKeysRow(i) {
+    var row = ui.seqRows[i];
+    if (!row) return;
+    var lab = row.children[0];
+    if (lab) lab.classList.toggle("keys-mode", !!keysMode[i]);
+    for (var s = 0; s < STEPS; s++) {
+      var b = ui.stepBtns[i][s];
+      if (keysMode[i]) {
+        var semi = s - 8;
+        b.textContent = (semi > 0 ? "+" : "") + semi;
+        b.classList.add("semi");
+        b.classList.toggle("root", semi === 0);
+        b.classList.remove("on");
+        b.setAttribute("aria-label", PAD_DEFS[i].name + " key " + semi + " semitones");
+      } else {
+        b.textContent = String(s + 1);
+        b.classList.remove("semi"); b.classList.remove("root");
+        b.classList.toggle("on", !!state.pattern[i][s]);
+        b.setAttribute("aria-label", PAD_DEFS[i].name + " step " + (s + 1));
+      }
+    }
+  }
+
   // EP-133 module LCD: live BPM / swing readout.
   function paintKoMeta() {
     if (!ui.koMeta) return;
@@ -1733,7 +1915,7 @@
     var wrap = el("div", "ctl", parent);
     var lab = el("label", "", wrap);
     var nameSpan = el("span", "", lab); nameSpan.textContent = label;
-    var valEl = el("b", "", lab); valEl.textContent = fmt(val);
+    var valEl = el("b", "led", lab); valEl.textContent = fmt(val);
     var input = el("input", "", wrap);
     input.type = "range"; input.min = min; input.max = max; input.step = step;
     input.value = val;
@@ -1764,17 +1946,63 @@
     return { input: input, valEl: valEl, set: function (v) { input.value = v; valEl.textContent = fmt(v); } };
   }
 
+  // chunky rotary knob, K.O.-style: drag vertically to turn
+  function makeKnob(parent, label, min, max, val, fmt, onInput) {
+    var wrap = el("div", "knob-wrap", parent);
+    var knob = el("div", "knob", wrap);
+    knob.setAttribute("role", "slider");
+    knob.setAttribute("aria-label", label);
+    knob.setAttribute("aria-valuemin", min);
+    knob.setAttribute("aria-valuemax", max);
+    var dial = el("div", "knob-dial", knob);
+    var ind = el("div", "knob-ind", dial);
+    var valEl = el("div", "knob-val", wrap);
+    var lab = el("div", "knob-lab", wrap); lab.textContent = label;
+    var v = clamp(val, min, max);
+    function paint() {
+      valEl.textContent = fmt(v);
+      var ang = -135 + 270 * (v - min) / (max - min);
+      ind.style.transform = "rotate(" + ang + "deg)";
+      knob.setAttribute("aria-valuenow", Math.round(v));
+    }
+    function setLive(nv) { v = clamp(nv, min, max); paint(); onInput(v); }
+    var dragging = false, startY = 0, startV = 0;
+    knob.addEventListener("pointerdown", function (e) {
+      dragging = true; startY = e.clientY || 0; startV = v;
+      if (knob.setPointerCapture && e.pointerId != null) {
+        try { knob.setPointerCapture(e.pointerId); } catch (x) {}
+      }
+      if (e.preventDefault) e.preventDefault();
+    });
+    knob.addEventListener("pointermove", function (e) {
+      if (!dragging) return;
+      setLive(startV + (startY - (e.clientY || 0)) * (max - min) / 150);
+    });
+    function end() { dragging = false; }
+    knob.addEventListener("pointerup", end);
+    knob.addEventListener("pointercancel", end);
+    paint();
+    return { set: function (nv) { v = clamp(nv, min, max); paint(); }, el: knob };
+  }
+
   function buildUI() {
     var mount = (document.querySelector && document.querySelector(".chassis")) || document.body;
     var app = el("div", "", mount);
     app.id = "app";
     ui.edOpenFor = -1;
 
-    // ---- transport ----
+    // ---- transport: K.O. top panel ----
     var top = el("div", "top", app);
     var brand = el("div", "brand", top);
-    var h1 = el("h1", "", brand); h1.textContent = "SP-1200";
-    var sub = el("p", "", brand); sub.textContent = "12-BIT SAMPLING DRUM MACHINE";
+    var h1 = el("h1", "", brand);
+    h1.textContent = "SP-1200";
+    var badge = el("span", "ko-badge", h1); badge.textContent = "K.O.";
+    var sub = el("p", "", brand); sub.textContent = "12-BIT SAMPLING COMPOSER";
+
+    var msgLcd = el("div", "msg-lcd", top);
+    var msgTag = el("span", "msg-tag", msgLcd); msgTag.textContent = "MSG";
+    ui.msgText = el("div", "msg", msgLcd);
+    ui.msgText.textContent = defaultMsg();
 
     var transport = el("div", "transport", top);
     ui.playBtn = el("button", "play-btn", transport);
@@ -1792,10 +2020,10 @@
 
     ui.tempo = makeSlider(transport, "TEMPO", 60, 200, 1, state.bpm,
       function (v) { return Math.round(v) + " BPM"; },
-      function (v) { state.bpm = Math.round(v); paintKoMeta(); save(); });
+      function (v) { state.bpm = Math.round(v); paintKoMeta(); say("TEMPO " + state.bpm); save(); });
     ui.swing = makeSlider(transport, "SWING", 50, 75, 0.5, state.swing,
       function (v) { return v.toFixed(1) + "%"; },
-      function (v) { state.swing = v; paintKoMeta(); save(); });
+      function (v) { state.swing = v; paintKoMeta(); say("SWING " + v.toFixed(1) + "%"); save(); });
 
     var tapBtn = el("button", "btn", transport);
     tapBtn.textContent = "TAP";
@@ -1813,11 +2041,12 @@
         state.bpm = clamp(Math.round(60000 / avg), 60, 200);
         ui.tempo.set(state.bpm);
         paintKoMeta();
+        say("TAP " + state.bpm);
         save();
       }
     });
 
-    ui.master = makeSlider(transport, "MASTER", 0, 100, 1, state.master,
+    ui.master = makeKnob(transport, "MASTER", 0, 100, state.master,
       function (v) { return Math.round(v) + "%"; },
       function (v) {
         state.master = v;
@@ -1832,6 +2061,7 @@
     ui.spBtn.addEventListener("click", function () {
       state.spMode = !state.spMode;
       ui.spBtn.classList.toggle("on", state.spMode);
+      say(state.spMode ? "12-BIT PATH" : "CLEAN PATH");
       save();
     });
 
@@ -1847,65 +2077,12 @@
     ui.tapeBtn.setAttribute("aria-label", "Open the tape arranger");
     ui.tapeBtn.addEventListener("click", openTape);
 
-    ui.projBtn = el("button", "btn", transport);
-    ui.projBtn.textContent = "PROJECT";
-    ui.projBtn.title = "Save / load named projects";
-    ui.projBtn.setAttribute("aria-label", "Open project save and load");
-    ui.projBtn.addEventListener("click", toggleProjPanel);
-
-    ui.projPanel = el("div", "proj-panel", transport);
-    ui.projPanel.style.display = "none";
-    ui.projPanel.setAttribute("role", "dialog");
-    ui.projPanel.setAttribute("aria-label", "Project save and load");
-    var prow = el("div", "proj-row", ui.projPanel);
-    ui.projName = el("input", "proj-name", prow);
-    ui.projName.placeholder = "PROJECT NAME";
-    ui.projName.maxLength = 40;
-    ui.projName.setAttribute("aria-label", "Project name");
-    ui.projName.addEventListener("keydown", function (e) {
-      if (e.code === "Enter" || e.key === "Enter") { saveProject(ui.projName.value); ui.projName.value = ""; }
-      else if (e.code === "Escape") { if (ui.projName.blur) ui.projName.blur(); closeProjPanel(); }
-      if (e.stopPropagation) e.stopPropagation();
-    });
-    var saveB = el("button", "btn", prow);
-    saveB.textContent = "SAVE";
-    saveB.setAttribute("aria-label", "Save project under this name");
-    saveB.addEventListener("click", function () { saveProject(ui.projName.value); ui.projName.value = ""; });
-    var xrow = el("div", "proj-row", ui.projPanel);
-    var expB = el("button", "btn", xrow);
-    expB.textContent = "EXPORT";
-    expB.title = "Download this project as a .sp1200.json file";
-    expB.setAttribute("aria-label", "Export project to a file");
-    expB.addEventListener("click", exportProject);
-    var impB = el("button", "btn", xrow);
-    impB.textContent = "IMPORT";
-    impB.title = "Load a project from a .sp1200.json file";
-    impB.setAttribute("aria-label", "Import project from a file");
-    impB.addEventListener("click", function () { if (ui.projFile) ui.projFile.click(); });
-    ui.projFile = el("input", "", ui.projPanel);
-    ui.projFile.type = "file";
-    ui.projFile.accept = ".sp1200.json,.json,application/json";
-    ui.projFile.style.display = "none";
-    ui.projFile.setAttribute("aria-label", "Choose a project file to import");
-    ui.projFile.addEventListener("change", function () {
-      if (ui.projFile.files && ui.projFile.files[0]) importProjectFile(ui.projFile.files[0]);
-      ui.projFile.value = "";
-    });
-    ui.projStatus = el("div", "proj-status", ui.projPanel);
-    ui.projStatus.setAttribute("aria-live", "polite");
-    ui.projList = el("div", "proj-list", ui.projPanel);
-    var nrow = el("div", "proj-row", ui.projPanel);
-    var newB = el("button", "btn", nrow);
-    newB.textContent = "NEW";
-    newB.title = "Clear everything and start a fresh project";
-    newB.setAttribute("aria-label", "Start a new project");
-    newB.addEventListener("click", newProject);
-
     var spec = el("div", "spec", transport);
     spec.innerHTML = "<b>26.04 kHz</b> · <b>12-BIT</b><br>VARISPEED TUNING";
 
-    // ---- pads ----
-    var pt = el("div", "section-title", app); pt.textContent = "PERFORMANCE";
+
+    // ---- pads: SOUND ----
+    var pt = el("div", "section-title", app); pt.textContent = "SOUND";
     var padsEl = el("div", "pads", app);
     ui.padBtns = []; ui.padNames = []; ui.padCards = [];
 
@@ -1952,6 +2129,12 @@
         if (fileInput.files && fileInput.files[0]) loadSampleFile(i, fileInput.files[0]);
         fileInput.value = "";
       });
+      var micBtn = el("button", "btn", row);
+      micBtn.textContent = "MIC";
+      micBtn.title = "Sample the microphone straight onto this pad";
+      micBtn.setAttribute("aria-label", "Sample microphone for " + def.name);
+      micBtn.addEventListener("click", function () { sampleMic(i, micBtn); });
+      ui["padMic" + i] = micBtn;
       var resetBtn = el("button", "btn", row);
       resetBtn.textContent = "RESET";
       resetBtn.setAttribute("aria-label", "Reset " + def.name + " to built-in drum");
@@ -2013,10 +2196,18 @@
     ui.seqRows = []; ui.seqMutes = []; ui.stepBtns = [];
 
     PAD_DEFS.forEach(function (def, i) {
+      keysMode[i] = false;
       var row = el("div", "seq-row", seq);
       ui.seqRows.push(row);
       var lab = el("div", "seq-label", row);
+      lab.title = "Toggle KEYS mode: play this voice chromatically";
+      lab.setAttribute("role", "button");
       var labName = el("span", "", lab); labName.textContent = def.name;
+      var ktag = el("span", "keys-tag", lab); ktag.textContent = "KEYS";
+      lab.addEventListener("click", function (e) {
+        if (e.target && e.target.tagName === "BUTTON") return; // mute key keeps its job
+        toggleKeysMode(i);
+      });
       var m = el("button", "mini", lab);
       m.textContent = "M";
       m.setAttribute("aria-label", "Mute " + def.name);
@@ -2032,6 +2223,10 @@
           b.setAttribute("aria-label", def.name + " step " + (si + 1));
           if (state.pattern[pi][si]) b.classList.add("on");
           b.addEventListener("click", function () {
+            if (keysMode[pi]) {
+              playPad(pi, null, Math.pow(2, (si - 8) / 12)); // chromatic, -8..+7 st
+              return;
+            }
             state.pattern[pi][si] = state.pattern[pi][si] ? 0 : 1;
             b.classList.toggle("on", !!state.pattern[pi][si]);
             save();
@@ -2043,30 +2238,135 @@
     });
     paintKoMeta();
 
-    // ---- presets ----
-    var presetRow = el("div", "presets", app);
-    Object.keys(PRESETS).forEach(function (name) {
-      var b = el("button", "btn", presetRow);
-      b.textContent = name;
-      b.addEventListener("click", function () { applyPreset(name); });
+    // ---- punch-in FX: hold a key, bend the master bus, let go ----
+    var fxt = el("div", "section-title", app); fxt.textContent = "PUNCH-IN FX";
+    var fxm = el("div", "fx-mod", app);
+    el("div", "ko-grille", fxm);
+    var fxHead = el("div", "ko-head", fxm);
+    var fxTitle = el("div", "ko-title", fxHead); fxTitle.textContent = "PUNCH-IN FX";
+    var fxSub = el("small", "", fxTitle); fxSub.textContent = "HOLD TO BEND THE MASTER BUS";
+    var fxKeys = el("div", "fx-keys", fxm);
+    ui.fxKeys = [];
+    var FX_DEFS = [
+      { id: "filter", sub: "LP SWEEP" },
+      { id: "crush", sub: "4-BIT" },
+      { id: "stutter", sub: "16TH CHOP" },
+      { id: "drive", sub: "SATURATE" },
+      { id: "chorus", sub: "WIDE" },
+      { id: "delay", sub: "SLAPBACK" },
+    ];
+    FX_DEFS.forEach(function (fd) {
+      var b = el("button", "fx-key", fxKeys);
+      b.innerHTML = "";
+      var nm = el("span", "", b); nm.textContent = fd.id.toUpperCase();
+      var sb = el("small", "", b); sb.textContent = fd.sub;
+      b.setAttribute("aria-label", "Punch-in effect " + fd.id + " (hold)");
+      var on = function (e) {
+        if (e && e.preventDefault) e.preventDefault();
+        ensureAudio();
+        b.classList.add("live");
+        punchFX(fd.id, true);
+        say("FX " + fd.id.toUpperCase(), true);
+      };
+      var off = function () {
+        if (!b.classList.contains("live")) return;
+        b.classList.remove("live");
+        punchFX(fd.id, false);
+        say(defaultMsg());
+      };
+      b.addEventListener("pointerdown", on);
+      b.addEventListener("pointerup", off);
+      b.addEventListener("pointerleave", off);
+      b.addEventListener("pointercancel", off);
+      b.addEventListener("contextmenu", function (e) { if (e.preventDefault) e.preventDefault(); });
+      ui.fxKeys.push(b);
     });
-    var clearBtn = el("button", "btn", presetRow);
-    clearBtn.textContent = "Clear pattern";
+
+    // ---- projects: 9 K.O. slots (1-3 factory grooves, 4-9 yours) ----
+    var prt = el("div", "section-title", app); prt.textContent = "PROJECTS \u00B7 9 SLOTS";
+    var pm = el("div", "proj-mod", app);
+    el("div", "ko-grille", pm);
+    var pHead = el("div", "ko-head", pm);
+    var pTitle = el("div", "ko-title", pHead); pTitle.textContent = "PROJECTS";
+    var pSub = el("small", "", pTitle); pSub.textContent = "TAP = LOAD \u00B7 STORE + TAP = SAVE";
+    var pLcd = el("div", "proj-lcd", pm);
+    ui.projMsg = el("div", "msg", pLcd);
+    ui.projMsg.textContent = "9 PROJECT SLOTS";
+    var pKeys = el("div", "proj-keys", pm);
+    ui.projKeys = [];
+    for (var pgi = 0; pgi < 9; pgi++) {
+      (function (idx) {
+        var b = el("button", "proj-key", pKeys);
+        var dot = el("span", "dot", b);
+        var num = el("span", "", b); num.textContent = String(idx + 1);
+        var lab = el("small", "", b);
+        lab.textContent = idx < 3 ? FACTORY_SLOTS[idx].toUpperCase() : "EMPTY";
+        b.setAttribute("aria-label", "Project slot " + (idx + 1));
+        b.addEventListener("click", function () {
+          if (storeArmed) storeSlot(idx); else loadSlot(idx);
+        });
+        ui.projKeys.push(b);
+      })(pgi);
+    }
+    var pOps = el("div", "proj-ops", pm);
+    ui.storeBtn = el("button", "btn", pOps);
+    ui.storeBtn.textContent = "STORE";
+    ui.storeBtn.title = "Arm, then tap a slot 4-9 to save the current state";
+    ui.storeBtn.setAttribute("aria-label", "Arm project store");
+    ui.storeBtn.addEventListener("click", function () {
+      storeArmed = !storeArmed;
+      ui.storeBtn.classList.toggle("armed", storeArmed);
+      say(storeArmed ? "STORE ARMED - TAP SLOT" : "STORE OFF");
+    });
+    var expB = el("button", "btn", pOps);
+    expB.textContent = "EXPORT";
+    expB.title = "Download the current state as a .sp1200.json file";
+    expB.setAttribute("aria-label", "Export project to a file");
+    expB.addEventListener("click", exportProject);
+    var impB = el("button", "btn", pOps);
+    impB.textContent = "IMPORT";
+    ui.importBtn = impB;
+    impB.title = "Load a project from a .sp1200.json file";
+    impB.setAttribute("aria-label", "Import project from a file");
+    impB.addEventListener("click", function () { if (ui.projFile) ui.projFile.click(); });
+    ui.projFile = el("input", "", pOps);
+    ui.projFile.type = "file";
+    ui.projFile.accept = ".sp1200.json,.json,application/json";
+    ui.projFile.style.display = "none";
+    ui.projFile.setAttribute("aria-label", "Choose a project file to import");
+    ui.projFile.addEventListener("change", function () {
+      if (ui.projFile.files && ui.projFile.files[0]) importProjectFile(ui.projFile.files[0]);
+      ui.projFile.value = "";
+    });
+    var newB = el("button", "btn", pOps);
+    newB.textContent = "NEW";
+    newB.title = "Clear everything and start fresh";
+    newB.setAttribute("aria-label", "Start a new project");
+    newB.addEventListener("click", newProject);
+    var clearBtn = el("button", "btn", pOps);
+    clearBtn.textContent = "CLEAR";
+    clearBtn.title = "Clear the pattern";
+    clearBtn.setAttribute("aria-label", "Clear pattern");
     clearBtn.addEventListener("click", function () {
       for (var i = 0; i < PAD_DEFS.length; i++) {
         state.pattern[i] = new Array(STEPS).fill(0);
-        for (var s = 0; s < STEPS; s++) ui.stepBtns[i][s].classList.remove("on");
+        for (var s = 0; s < STEPS; s++) {
+          ui.stepBtns[i][s].classList.remove("on");
+          if (keysMode[i]) paintKeysRow(i);
+        }
       }
+      say("PATTERN CLEARED");
       save();
     });
+    paintSlots();
 
     var foot = el("div", "foot", app);
-    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; LOAD puts your own samples through the 12-bit path &nbsp;·&nbsp; SLICE chops a long sample across the pads &nbsp;·&nbsp; MONO / CHK voice modes per strip &nbsp;·&nbsp; delay lives in EDIT &nbsp;·&nbsp; TAPE bounces the pattern to a 4-track loop &nbsp;·&nbsp; play runs drums + tape together &nbsp;·&nbsp; PANIC kills all sound &nbsp;·&nbsp; PROJECT saves / loads / exports / imports";
+    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; click a voice name for KEYS mode &nbsp;·&nbsp; LOAD / MIC put your own samples through the 12-bit path &nbsp;·&nbsp; hold a PUNCH-IN FX key to bend the master bus &nbsp;·&nbsp; SLICE chops a long sample across the pads &nbsp;·&nbsp; MONO / CHK voice modes per strip &nbsp;·&nbsp; delay lives in EDIT &nbsp;·&nbsp; TAPE bounces the pattern to a 4-track loop &nbsp;·&nbsp; PROJECTS 1-3 are factory grooves, 4-9 are yours";
 
     // ---- keyboard ----
     document.addEventListener("keydown", function (e) {
       if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
-      if (e.code === "Escape") { closeEditor(); closeSlicer(); closeTape(); closeProjPanel(); return; }
+      if (e.code === "Escape") { closeEditor(); closeSlicer(); closeTape(); return; }
       if (e.code === "Space") {
         e.preventDefault();
         if (state.playing || anyTapePlaying()) globalStop(); else globalPlay();
@@ -2108,7 +2408,8 @@
       ui.padCards[i].classList.toggle("muted", p.muted);
       ui.seqRows[i].classList.toggle("muted", p.muted);
       ui.seqMutes[i].classList.toggle("on", p.muted);
-      for (var s = 0; s < STEPS; s++) ui.stepBtns[i][s].classList.toggle("on", !!state.pattern[i][s]);
+      if (keysMode[i]) paintKeysRow(i);
+      else for (var s = 0; s < STEPS; s++) ui.stepBtns[i][s].classList.toggle("on", !!state.pattern[i][s]);
     });
     paintTape();
     for (var ti = 0; ti < TAPE_COUNT; ti++) drawTapeWave(ti);
@@ -2159,8 +2460,12 @@
     _tapeToSlicer: tapeToSlicer,
     _globalPlay: globalPlay, _globalStop: globalStop, _panic: panic,
     _anyTapePlaying: anyTapePlaying, _paintTransport: paintTransport,
-    _saveProject: saveProject, _loadProject: loadProject, _deleteProject: deleteProject,
-    _listProjects: loadProjectIndex, _paintProjects: paintProjects,
+    _say: say, _punchFX: punchFX, _allFXOff: allFXOff,
+    _fxLive: function () { return fxLive; },
+    _loadSlot: loadSlot, _storeSlot: storeSlot, _slotHas: slotHas, _paintSlots: paintSlots,
+    _currentSlot: function () { return currentSlot; },
+    _toggleKeys: toggleKeysMode, _keysMode: function () { return keysMode.slice(); },
+    _sampleMic: sampleMic, _stopMic: stopMicCapture,
     _exportProject: exportProject, _importProjectFile: importProjectFile,
     _projectFileName: projectFileName,
     _serializeProject: serializeProject, _syncUI: syncUIFromState,

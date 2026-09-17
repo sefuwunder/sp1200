@@ -22,9 +22,12 @@ Roger Linn-style swing on the 16th grid: even 16ths stay locked, odd 16ths slide
 bun start   # http://localhost:3007
 ```
 
-- **Pads** — click, tap `1`–`8`, or program the 16-step sequencer. Each pad has TUNE (± octave varispeed), LEVEL, MUTE, LOAD (drop your own sample through the 12-bit path), and RESET.
-- **Transport** — play/stop (`Space`), TEMPO with TAP, SWING, MASTER, SP-1200 bypass.
-- **Presets** — Boom Bap, Trap, House, plus Clear. Pattern, tempo, swing, and pad settings persist in localStorage.
+- **Pads** — click, tap `1`–`8`, or program the STEP COMPOSER. Each pad has TUNE (± octave varispeed), LEVEL, MUTE, LOAD (drop your own sample through the 12-bit path), MIC (sample straight off the microphone), and RESET.
+- **Transport** — play/stop (`Space`), TEMPO with TAP, SWING, a MASTER rotary knob, SP-1200 bypass, and a message LCD that narrates every action.
+- **PUNCH-IN FX** — six momentary keys (LP filter, 4-bit crusher, 16th-note stutter, drive, chorus, slapback delay) that bend the master bus while held and vanish on release.
+- **KEYS mode** — click a voice name in the STEP COMPOSER to turn its 16 keys chromatic (-8…+7 semitones) for pitched performance; click again to return to step programming.
+- **PROJECTS** — 9 slots: 1–3 hold factory grooves (Boom Bap, Trap, House), 4–9 are yours (STORE + tap a slot). Tap a slot to load, plus EXPORT / IMPORT / NEW.
+- Everything else — pattern, tempo, swing, and pad settings — persists in localStorage.
 
 ## Layout
 
