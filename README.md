@@ -29,6 +29,8 @@ bun start   # http://localhost:3007
 - **PROJECTS** — 9 slots: 1–3 hold factory grooves (Boom Bap, Trap, House), 4–9 are yours (STORE + tap a slot). Tap a slot to load, plus EXPORT / IMPORT / NEW.
 - Everything else — pattern, tempo, swing, and pad settings — persists in localStorage.
 
+The whole machine fits a 1920×1080 screen with no scrolling: the layout is condensed and PUNCH-IN FX sits beside PROJECTS on wide displays. On shorter viewports the machine scales down just enough to fit (never up, never below 72%).
+
 ## Layout
 
 - `src/server.ts` — Bun static server (port 3007)

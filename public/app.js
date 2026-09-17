@@ -2238,9 +2238,14 @@
     });
     paintKoMeta();
 
+    // ---- punch-in FX + projects side-by-side (fits 1080p) ----
+    var duo = el("div", "duo", app);
+    var duoA = el("div", "duo-col", duo);
+    var duoB = el("div", "duo-col", duo);
+    ui.duo = duo; ui.duoA = duoA; ui.duoB = duoB;
     // ---- punch-in FX: hold a key, bend the master bus, let go ----
-    var fxt = el("div", "section-title", app); fxt.textContent = "PUNCH-IN FX";
-    var fxm = el("div", "fx-mod", app);
+    var fxt = el("div", "section-title", duoA); fxt.textContent = "PUNCH-IN FX";
+    var fxm = el("div", "fx-mod", duoA);
     el("div", "ko-grille", fxm);
     var fxHead = el("div", "ko-head", fxm);
     var fxTitle = el("div", "ko-title", fxHead); fxTitle.textContent = "PUNCH-IN FX";
@@ -2283,8 +2288,8 @@
     });
 
     // ---- projects: 9 K.O. slots (1-3 factory grooves, 4-9 yours) ----
-    var prt = el("div", "section-title", app); prt.textContent = "PROJECTS \u00B7 9 SLOTS";
-    var pm = el("div", "proj-mod", app);
+    var prt = el("div", "section-title", duoB); prt.textContent = "PROJECTS \u00B7 9 SLOTS";
+    var pm = el("div", "proj-mod", duoB);
     el("div", "ko-grille", pm);
     var pHead = el("div", "ko-head", pm);
     var pTitle = el("div", "ko-title", pHead); pTitle.textContent = "PROJECTS";
@@ -2438,10 +2443,30 @@
     buildUI();
     if (!any) applyPreset("Boom Bap");
     else syncUIFromState(); // reflect loaded state in the freshly built UI
+    fitViewport();
+    if (typeof window !== "undefined" && window.addEventListener) {
+      window.addEventListener("resize", fitViewport);
+    }
+  }
+
+  // Scale the machine down just enough to fit short viewports (e.g. 1080p
+  // with browser chrome): never scales up, never below 0.72.
+  function fitViewport() {
+    if (typeof document === "undefined" || !document.querySelector) return;
+    var m = document.querySelector(".machine");
+    if (!m) return;
+    m.style.zoom = "";
+    var h = m.getBoundingClientRect().height + 20;
+    var vh = (typeof window !== "undefined" && window.innerHeight) || 900;
+    var z = vh / h;
+    if (z > 1) z = 1;
+    if (z < 0.72) z = 0.72;
+    if (z < 1) m.style.zoom = z;
   }
 
   // expose for tests
   var api = { init: init, state: state, ui: ui, applyPreset: applyPreset, PAD_DEFS: PAD_DEFS, PRESETS: PRESETS,
+    _fitViewport: fitViewport,
     _playPad: function (i, w) { return playPad(i, w); },
     _scheduleStep: function (s, t) { return scheduleStep(s, t); },
     _start: startTransport, _stop: stopTransport,

@@ -814,5 +814,15 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
   impBtn.click();
   ok(pickerOpened, "IMPORT opens the file picker");
 
+  // ---- condensed 1080p layout: FX + PROJECTS share a duo row ----
+  ok(ui.duo && ui.duo.className === "duo", "FX and PROJECTS share a duo wrapper");
+  ok(ui.duo.children.length === 2 &&
+     ui.duo.children[0].className === "duo-col" &&
+     ui.duo.children[1].className === "duo-col", "duo holds two columns");
+  ok(ui.duo.children[0].children[0].textContent === "PUNCH-IN FX", "FX module lives in column one");
+  ok(ui.duo.children[1].children[0].textContent === "PROJECTS · 9 SLOTS", "PROJECTS module lives in column two");
+  SP._fitViewport();
+  ok(true, "fitViewport runs without error");
+
   console.log("\nui: " + n + " passed");
 })().catch(function (e) { console.error("TAPE TESTS FAILED:", e); process.exit(1); });
