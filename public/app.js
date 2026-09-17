@@ -1191,7 +1191,7 @@
       root: root, title: title, canvas: cv, info: info, chips: chips,
       nInput: nInput, fileInput: fileInput, padBtns: padBtns,
       tape: null, tapeName: "", markers: [], selSeg: 0, chipBtns: [],
-      dragIdx: -1, auditionSrc: null, tapeUndo: [],
+      dragIdx: -1, auditionSrc: null, tapeUndo: [], peaks: null,
       trimBtn: trimBtn, cropBtn: cropBtn, undoBtn: undoBtn, panicBtn: panicBtn,
     };
 
@@ -1224,6 +1224,7 @@
         for (var i = 0; i < segs.length; i++) {
           if (s >= segs[i].start && s < segs[i].end) { sl.selSeg = i; break; }
         }
+        rebuildChips();
         auditionSegment(sl.selSeg);
       }
       if (e.preventDefault) e.preventDefault();
@@ -1231,7 +1232,7 @@
     cv.addEventListener("pointermove", function (e) {
       if (sl.dragIdx < 0 || !sl.tape) return;
       sl.markers[sl.dragIdx] = clamp(frac(e), 0.002, 0.998);
-      drawSlicerWave();
+      requestSlicerDraw();
     });
     cv.addEventListener("pointerup", function () {
       if (sl.dragIdx >= 0) { sl.dragIdx = -1; syncSlicer(); }
@@ -1425,55 +1426,92 @@
       g2d.fillStyle = "rgba(255,176,0,0.10)";
       g2d.fillRect(seg.start / d.length * W, 0, (seg.end - seg.start) / d.length * W, H);
     }
-    g2d.strokeStyle = "#ffb000";
-    g2d.lineWidth = 1;
-    g2d.beginPath();
-    for (var x = 0; x < W; x++) {
-      var a = Math.floor(x / W * d.length);
-      var b = Math.max(a + 1, Math.floor((x + 1) / W * d.length));
-      var mn = 1, mx = -1;
-      for (var k = a; k < b && k < d.length; k++) {
-        var v = d[k];
-        if (v < mn) mn = v;
-        if (v > mx) mx = v;
+    // waveform from the precomputed peak cache: O(canvas width), never O(tape)
+    var pk = sl.peaks;
+    if (pk) {
+      g2d.strokeStyle = "#ffb000";
+      g2d.lineWidth = 1;
+      g2d.beginPath();
+      for (var x = 0; x < W; x++) {
+        var c = Math.min(pk.cols - 1, (x * pk.cols / W) | 0);
+        g2d.moveTo(x + 0.5, mid - pk.max[c] * amp);
+        g2d.lineTo(x + 0.5, mid - pk.min[c] * amp + 0.5);
       }
-      if (mx < mn) { mx = 0; mn = 0; }
-      g2d.moveTo(x + 0.5, mid - mx * amp);
-      g2d.lineTo(x + 0.5, mid - mn * amp + 0.5);
+      g2d.stroke();
     }
-    g2d.stroke();
-    // markers, numbered
+    // markers: one batched stroke; numbers only when sparse enough to read
     var marks = sl.markers.slice().sort(function (p, q) { return p - q; });
-    g2d.font = "9px sans-serif";
-    g2d.textAlign = "left";
+    g2d.strokeStyle = "#ffd47a";
+    g2d.lineWidth = 1.5;
+    g2d.beginPath();
     for (var m = 0; m < marks.length; m++) {
       var mxp = marks[m] * W;
-      g2d.strokeStyle = "#ffd47a";
-      g2d.lineWidth = 1.5;
-      g2d.beginPath();
       g2d.moveTo(mxp, 0);
       g2d.lineTo(mxp, H);
-      g2d.stroke();
-      g2d.fillStyle = "#ffd47a";
-      g2d.fillText(String(m + 1), mxp + 3, 11);
     }
+    g2d.stroke();
+    if (marks.length <= 96) {
+      g2d.font = "9px sans-serif";
+      g2d.textAlign = "left";
+      g2d.fillStyle = "#ffd47a";
+      for (var m2 = 0; m2 < marks.length; m2++) {
+        g2d.fillText(String(m2 + 1), marks[m2] * W + 3, 11);
+      }
+    }
+  }
+
+  // Min/max peak cache over the tape, built once per tape load. Drawing the
+  // waveform then costs O(canvas width) instead of O(tape samples), which is
+  // what keeps marker drags smooth on song-length tapes.
+  function buildTapePeaks() {
+    if (!sl || !sl.tape) { if (sl) sl.peaks = null; return; }
+    var d = sl.tape, n = d.length, COLS = 2048;
+    var mn = new Float32Array(COLS), mx = new Float32Array(COLS);
+    for (var c = 0; c < COLS; c++) {
+      var a = Math.floor(c / COLS * n), b = Math.max(a + 1, Math.floor((c + 1) / COLS * n));
+      var lo = 1, hi = -1;
+      for (var k = a; k < b && k < n; k++) {
+        var v = d[k];
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+      if (hi < lo) { lo = 0; hi = 0; }
+      mn[c] = lo; mx[c] = hi;
+    }
+    sl.peaks = { min: mn, max: mx, cols: COLS };
+  }
+
+  // Redraw at most once per animation frame while dragging a marker, so a
+  // burst of pointermove events can't queue up expensive redraws.
+  function requestSlicerDraw() {
+    if (!sl || sl._drawQueued) return;
+    sl._drawQueued = true;
+    var raf = (typeof requestAnimationFrame === "function") ? requestAnimationFrame : function (fn) { fn(); return 0; };
+    raf(function () { if (sl) sl._drawQueued = false; drawSlicerWave(); });
   }
 
   function rebuildChips() {
     if (!sl) return;
-    sl.chips.innerHTML = "";
-    sl.chipBtns = [];
     var segs = slicerSegments();
-    if (!segs.length) return;
     var sr = DSP.SYNTH_RATE;
-    for (var i = 0; i < segs.length; i++) {
-      (function (idx) {
-        var b = el("button", "seg-chip", sl.chips);
-        b.textContent = (idx + 1) + "  " + (segs[idx].start / sr).toFixed(2) + "–" + (segs[idx].end / sr).toFixed(2) + "s";
-        b.setAttribute("aria-label", "Audition segment " + (idx + 1));
-        b.addEventListener("click", function () { auditionSegment(idx); });
-        sl.chipBtns.push(b);
-      })(i);
+    if (sl.chipBtns.length === segs.length && segs.length > 0) {
+      // same segment count: refresh labels in place, no DOM churn
+      for (var i = 0; i < segs.length; i++) {
+        sl.chipBtns[i].textContent = (i + 1) + "  " + (segs[i].start / sr).toFixed(2) + "\u2013" + (segs[i].end / sr).toFixed(2) + "s";
+      }
+    } else {
+      sl.chips.innerHTML = "";
+      sl.chipBtns = [];
+      if (!segs.length) return;
+      for (var j = 0; j < segs.length; j++) {
+        (function (idx) {
+          var b = el("button", "seg-chip", sl.chips);
+          b.textContent = (idx + 1) + "  " + (segs[idx].start / sr).toFixed(2) + "\u2013" + (segs[idx].end / sr).toFixed(2) + "s";
+          b.setAttribute("aria-label", "Audition segment " + (idx + 1));
+          b.addEventListener("click", function () { auditionSegment(idx); });
+          sl.chipBtns.push(b);
+        })(j);
+      }
     }
     paintChips();
   }
@@ -1509,7 +1547,8 @@
     // single-audio preview: a new audition cuts off any still-ringing one
     // so previewing slices never clashes with itself
     if (sl.auditionSrc) { try { sl.auditionSrc.stop(); } catch (e) {} }
-    var cut = sl.tape.slice(segs[i].start, segs[i].end);
+    // subarray: zero-copy view; copyToChannel does the one unavoidable copy
+    var cut = sl.tape.subarray(segs[i].start, segs[i].end);
     var buf = ctx.createBuffer(1, cut.length, DSP.SYNTH_RATE);
     buf.copyToChannel(cut, 0);
     var src = ctx.createBufferSource();
@@ -1544,6 +1583,7 @@
     var u = sl.tapeUndo.pop();
     sl.tape = u.tape; sl.markers = u.markers; sl.tapeName = u.tapeName;
     sl.selSeg = Math.min(u.selSeg, Math.max(0, slicerSegments().length - 1));
+    buildTapePeaks();
     syncSlicer();
   }
 
@@ -1584,6 +1624,7 @@
     sl.markers = [];
     sl.selSeg = 0;
     stopSlicerAudition();
+    buildTapePeaks();
     syncSlicer();
   }
 
@@ -1658,6 +1699,7 @@
     sl.selSeg = 0;
     sl.tapeUndo = [];
     sl.auditionSrc = null;
+    buildTapePeaks();
     syncSlicer();
   }
 

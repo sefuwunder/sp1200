@@ -371,6 +371,47 @@ const slicerAud = ac().lastSource;
 sl.panicBtn.click();
 ok(slicerAud.stopped, "slicer PANIC stops the ringing audition");
 
+// ---- slicer perf refactor: peak cache + chip diffing + drag throttle ----
+// peak cache is built on tape load
+SP._slicerSetTape(burstTape(SR, [0.25, 0.75, 1.25, 1.75]), "peaktest");
+sl = SP._slicer();
+ok(sl.peaks && sl.peaks.cols === 2048 && sl.peaks.min.length === 2048 && sl.peaks.max.length === 2048, "tape load builds a 2048-column peak cache");
+let peakMax = 0;
+for (let p = 0; p < sl.peaks.cols; p++) if (sl.peaks.max[p] > peakMax) peakMax = sl.peaks.max[p];
+ok(peakMax > 0.5, "peak cache reflects the actual audio");
+
+// chip buttons are reused (labels refreshed in place) when the count is unchanged
+sl.nInput.value = 4;
+SP._slicerEqual();
+const chip0 = sl.chipBtns[0];
+sl.dragIdx = 0;
+sl.markers[0] = 0.3;
+sl.canvas._handlers.pointermove[0]({ clientX: 200 });
+ok(Math.abs(sl.markers[0] - 200 / 640) < 0.01, "dragging a marker moves it");
+sl.canvas._handlers.pointerup[0]();
+ok(sl.chipBtns[0] === chip0, "chip buttons are reused when the segment count is unchanged");
+ok(sl.chipBtns.length === SP._slicerSegments().length, "chip row still matches the segments after a drag");
+
+// marker add refreshes the chip row (was stale before the refactor)
+SP._slicerSetTape(burstTape(SR, [0.25, 0.75, 1.25, 1.75]), "clktest");
+sl = SP._slicer();
+const chipsBefore = sl.chipBtns.length;
+sl.canvas._handlers.pointerdown[0]({ clientX: 320, preventDefault: function () {} });
+ok(sl.chipBtns.length === chipsBefore + 1, "clicking the waveform to add a marker refreshes the chip row");
+
+// crop rebuilds the peak cache for the shorter tape; undo restores it
+SP._slicerSetTape(burstTape(SR, [0.25, 0.75, 1.25, 1.75]), "croptest");
+sl = SP._slicer();
+sl.nInput.value = 4;
+SP._slicerEqual();
+SP._auditionSegment(1);
+const fullLen = sl.tape.length;
+SP._slicerCrop();
+ok(sl.peaks && sl.peaks.cols === 2048, "crop rebuilds the peak cache");
+ok(sl.tape.length < fullLen, "crop shortened the tape");
+SP._slicerUndo();
+ok(sl.peaks && sl.tape.length === fullLen, "undo restores the tape and its peak cache");
+
 SP._closeSlicer();
 ok(SP._slicer().root.style.display === "none", "slicer closes");
 SP._openSlicer();
