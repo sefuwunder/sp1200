@@ -1714,10 +1714,19 @@
     for (var i = 0; i < ui.stepBtns.length; i++)
       for (var s = 0; s < ui.stepBtns[i].length; s++)
         ui.stepBtns[i][s].classList.remove("now");
+    if (ui.koStepNum) ui.koStepNum.textContent = "--";
+    if (ui.koLcd) ui.koLcd.classList.remove("playing");
   }
   function highlightStep(step) {
     clearPlayhead();
     for (var i = 0; i < ui.stepBtns.length; i++) ui.stepBtns[i][step].classList.add("now");
+    if (ui.koStepNum) ui.koStepNum.textContent = (step < 9 ? "0" : "") + (step + 1);
+    if (ui.koLcd) ui.koLcd.classList.add("playing");
+  }
+  // EP-133 module LCD: live BPM / swing readout.
+  function paintKoMeta() {
+    if (!ui.koMeta) return;
+    ui.koMeta.textContent = Math.round(state.bpm) + " BPM \u00B7 SW " + state.swing.toFixed(1) + "%";
   }
 
   function makeSlider(parent, label, min, max, step, val, fmt, onInput) {
@@ -1783,10 +1792,10 @@
 
     ui.tempo = makeSlider(transport, "TEMPO", 60, 200, 1, state.bpm,
       function (v) { return Math.round(v) + " BPM"; },
-      function (v) { state.bpm = Math.round(v); save(); });
+      function (v) { state.bpm = Math.round(v); paintKoMeta(); save(); });
     ui.swing = makeSlider(transport, "SWING", 50, 75, 0.5, state.swing,
       function (v) { return v.toFixed(1) + "%"; },
-      function (v) { state.swing = v; save(); });
+      function (v) { state.swing = v; paintKoMeta(); save(); });
 
     var tapBtn = el("button", "btn", transport);
     tapBtn.textContent = "TAP";
@@ -1803,6 +1812,7 @@
         var avg = diffs.reduce(function (a, b) { return a + b; }, 0) / diffs.length;
         state.bpm = clamp(Math.round(60000 / avg), 60, 200);
         ui.tempo.set(state.bpm);
+        paintKoMeta();
         save();
       }
     });
@@ -1980,14 +1990,30 @@
       paintChoke(i);
     });
 
-    // ---- sequencer ----
+    // ---- sequencer: EP-133 "K.O." composer module ----
     var st = el("div", "section-title", app); st.textContent = "PROGRAMMING";
     var seq = el("div", "seq", app);
-    var screen = el("div", "screen", seq);
+    el("div", "ko-grille", seq);
+    var koHead = el("div", "ko-head", seq);
+    var koTitle = el("div", "ko-title", koHead); koTitle.textContent = "STEP COMPOSER";
+    var koSub = el("small", "", koTitle); koSub.textContent = "16 STEP \u00B7 8 VOICE";
+    var koTabs = el("div", "ko-tabs", koHead);
+    ["OUTPUT", "INPUT", "MIDI", "USB"].forEach(function (t, ti) {
+      var tb = el("span", "", koTabs); tb.textContent = t;
+      if (ti === 1) tb.classList.add("hot");
+    });
+    var lcd = el("div", "ko-lcd", seq);
+    ui.koLcd = lcd;
+    var barTag = el("span", "bar-tag", lcd); barTag.textContent = "BAR";
+    var digits = el("div", "digits", lcd);
+    ui.koStepNum = el("span", "", digits); ui.koStepNum.textContent = "--";
+    var slash = el("small", "", digits); slash.textContent = " / 16";
+    el("span", "play-dot", lcd);
+    ui.koMeta = el("div", "meta", lcd);
     ui.seqRows = []; ui.seqMutes = []; ui.stepBtns = [];
 
     PAD_DEFS.forEach(function (def, i) {
-      var row = el("div", "seq-row", screen);
+      var row = el("div", "seq-row", seq);
       ui.seqRows.push(row);
       var lab = el("div", "seq-label", row);
       var labName = el("span", "", lab); labName.textContent = def.name;
@@ -2002,6 +2028,7 @@
       for (var s = 0; s < STEPS; s++) {
         (function (pi, si) {
           var b = el("button", "step" + (si % 4 === 0 ? " beat" : ""), stepsEl);
+          b.textContent = String(si + 1);
           b.setAttribute("aria-label", def.name + " step " + (si + 1));
           if (state.pattern[pi][si]) b.classList.add("on");
           b.addEventListener("click", function () {
@@ -2014,6 +2041,7 @@
       }
       ui.stepBtns.push(btns);
     });
+    paintKoMeta();
 
     // ---- presets ----
     var presetRow = el("div", "presets", app);
@@ -2066,6 +2094,7 @@
   function syncUIFromState() {
     ui.tempo.set(state.bpm);
     ui.swing.set(state.swing);
+    paintKoMeta();
     ui.master.set(state.master);
     ui.spBtn.classList.toggle("on", state.spMode);
     state.pads.forEach(function (p, i) {
