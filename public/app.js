@@ -479,23 +479,63 @@
     return voice;
   }
 
-  function playPad(idx, when, rateMul) {
+  function playPad(idx, when, rateMul, audition) {
     var p = state.pads[idx];
     if (!p || p.muted) return;
     ensureAudio();
     playPadOn(ctx, masterGain, idx, when == null ? ctx.currentTime : when, liveVS(), rateMul);
     flashPad(idx);
+    // live record: real pad hits (keys, strips, KEYS mode) punch into the
+    // pattern while REC is armed and the transport runs; auditions and
+    // scheduled pattern playback never record
+    if (when == null && !audition) maybeRecord(idx);
   }
 
   // ---------------- sequencer ----------------
   var timer = null, curStep = 0, nextGridTime = 0;
   var LOOKAHEAD = 0.12, TICK_MS = 25;
 
+  // ---------------- live record ----------------
+  // REC arms the pattern: while armed and the transport runs, real pad hits
+  // (keyboard 1-8, pad strips, KEYS-mode chromatic) punch into the step that
+  // is sounding right now. stepHist tracks recently scheduled steps so the
+  // hit lands on the step under the playhead, not the lookahead step.
+  var recArmed = false;
+  var stepHist = []; // { step, time } of recently scheduled steps
+  function toggleRec() {
+    recArmed = !recArmed;
+    paintRec();
+    say(recArmed ? "REC ARMED" : "REC OFF");
+  }
+  function paintRec() {
+    if (!ui.recBtn) return;
+    ui.recBtn.classList.toggle("armed", recArmed);
+    ui.recBtn.setAttribute("aria-pressed", recArmed ? "true" : "false");
+  }
+  function recordStepNow() {
+    var now = ctx.currentTime;
+    var s = stepHist.length ? stepHist[0].step : 0;
+    for (var i = stepHist.length - 1; i >= 0; i--) {
+      s = stepHist[i].step;
+      if (stepHist[i].time <= now + 0.001) break;
+    }
+    return s;
+  }
+  function maybeRecord(idx) {
+    if (!recArmed || !state.playing) return;
+    var s = recordStepNow();
+    if (state.pattern[idx][s]) return; // already punched in
+    state.pattern[idx][s] = 1;
+    if (ui.stepBtns[idx] && ui.stepBtns[idx][s]) ui.stepBtns[idx][s].classList.add("on");
+    save();
+  }
+
   function startTransport() {
     ensureAudio();
     if (state.playing) return;
     state.playing = true;
     curStep = 0;
+    stepHist = [];
     nextGridTime = ctx.currentTime + 0.08;
     timer = setInterval(schedulerTick, TICK_MS);
     paintTransport();
@@ -566,6 +606,8 @@
     var d = DSP.sixteenthDur(state.bpm);
     // swing: odd 16ths slide late inside their pair
     var t = gridTime + (DSP.stepTime16(step, state.bpm, state.swing) - step * d);
+    stepHist.push({ step: step, time: gridTime });
+    while (stepHist.length > 4) stepHist.shift();
     for (var i = 0; i < state.pads.length; i++) {
       if (state.pattern[i][step] && !state.pads[i].muted) playPad(i, t);
     }
@@ -980,7 +1022,7 @@
     p._undo = null;
     p.selStart = 0; p.selEnd = 1;
     if (ui.edOpenFor === padIdx) syncEditor();
-    playPad(padIdx);
+    playPad(padIdx, null, null, true);
     save();
   }
   function loadSampleFile(padIdx, file) {
@@ -1121,7 +1163,7 @@
     refreshSample(i);
     p.selStart = 0; p.selEnd = 1;
     drawWave();
-    playPad(i); // audition the edit
+    playPad(i, null, null, true); // audition the edit
     save();
   }
 
@@ -1884,7 +1926,7 @@
     p.customName = ("SLC " + (sl.selSeg + 1)).slice(0, 12).toUpperCase();
     paintPadName(padIdx);
     p.selStart = 0; p.selEnd = 1;
-    playPad(padIdx); // audition the chop through the SP path
+    playPad(padIdx, null, null, true); // audition the chop through the SP path
     save();
     updateSlicerInfo();
   }
@@ -2099,6 +2141,13 @@
     ui.playBtn.addEventListener("click", function () {
       if (state.playing || anyTapePlaying()) globalStop(); else globalPlay();
     });
+
+    ui.recBtn = el("button", "btn rec-btn", transport);
+    ui.recBtn.textContent = "REC";
+    ui.recBtn.title = "Arm live record: pad hits punch into the pattern while playing (R)";
+    ui.recBtn.setAttribute("aria-label", "Arm live record");
+    ui.recBtn.setAttribute("aria-pressed", "false");
+    ui.recBtn.addEventListener("click", toggleRec);
 
     ui.panicBtn = el("button", "btn panic", transport);
     ui.panicBtn.textContent = "PANIC";
@@ -2460,15 +2509,17 @@
     paintSlots();
 
     var foot = el("div", "foot", app);
-    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; click a voice name for KEYS mode &nbsp;·&nbsp; LOAD / MIC put your own samples through the 12-bit path &nbsp;·&nbsp; hold a PUNCH-IN FX key to bend the master bus &nbsp;·&nbsp; SLICE chops a long sample across the pads &nbsp;·&nbsp; MONO / CHK voice modes per strip &nbsp;·&nbsp; delay lives in EDIT &nbsp;·&nbsp; TAPE bounces the pattern to a 4-track loop &nbsp;·&nbsp; PROJECTS 1-3 are factory grooves, 4-9 are yours";
+    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; <kbd>R</kbd> arm live record &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; click a voice name for KEYS mode &nbsp;·&nbsp; LOAD / MIC put your own samples through the 12-bit path &nbsp;·&nbsp; hold a PUNCH-IN FX key to bend the master bus &nbsp;·&nbsp; SLICE chops a long sample across the pads &nbsp;·&nbsp; MONO / CHK voice modes per strip &nbsp;·&nbsp; delay lives in EDIT &nbsp;·&nbsp; TAPE bounces the pattern to a 4-track loop &nbsp;·&nbsp; PROJECTS 1-3 are factory grooves, 4-9 are yours";
 
     // ---- keyboard ----
     document.addEventListener("keydown", function (e) {
       if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
-      if (e.code === "Escape") { closeEditor(); closeSlicer(); closeTape(); return; }
+      if (e.code === "Escape") { closeEditor(); closeSlicer(); closeTape(); closeNames(); return; }
       if (e.code === "Space") {
         e.preventDefault();
         if (state.playing || anyTapePlaying()) globalStop(); else globalPlay();
+      } else if (e.key === "r" || e.key === "R") {
+        toggleRec();
       } else {
         var n = parseInt(e.key, 10);
         if (n >= 1 && n <= 8) playPad(n - 1);
@@ -2561,7 +2612,9 @@
   // expose for tests
   var api = { init: init, state: state, ui: ui, applyPreset: applyPreset, PAD_DEFS: PAD_DEFS, PRESETS: PRESETS,
     _fitViewport: fitViewport,
-    _playPad: function (i, w) { return playPad(i, w); },
+    _playPad: function (i, w, r, a) { return playPad(i, w, r, a); },
+    _toggleRec: toggleRec, _recArmed: function () { return recArmed; },
+    _maybeRecord: maybeRecord, _recordStepNow: recordStepNow,
     _scheduleStep: function (s, t) { return scheduleStep(s, t); },
     _start: startTransport, _stop: stopTransport,
     _setFilterType: setFilterType, _cycleFilter: cycleFilter,

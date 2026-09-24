@@ -854,5 +854,44 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
   ok(SP.state.pads.every(function (p) { return p.label === null; }), "renamePads([]) resets every pad to its default name");
   ok(SP._padLabel(0) === "KICK" && ui.padNames[0].textContent === "KICK", "reset restores the built-in names everywhere");
 
+  // ---- live record of keyboard input ----
+  ok(SP._recArmed() === false, "REC starts disarmed");
+  ok(ui.recBtn && ui.recBtn.textContent === "REC", "REC button sits in the transport");
+  SP._toggleRec();
+  ok(SP._recArmed() === true, "toggleRec arms recording");
+  ok(ui.recBtn.classList.contains("armed"), "REC button lights when armed");
+  SP._toggleRec();
+  ok(SP._recArmed() === false, "toggleRec disarms again");
+  ok(!ui.recBtn.classList.contains("armed"), "REC button dark when disarmed");
+  // R key arms/disarms (the stub records document listeners)
+  listeners.keydown({ target: { tagName: "BODY" }, code: "", key: "r" });
+  ok(SP._recArmed() === true, "R key arms live record");
+  listeners.keydown({ target: { tagName: "BODY" }, code: "", key: "R" });
+  ok(SP._recArmed() === false, "shift-R disarms live record");
+  // no record while stopped
+  SP._toggleRec();
+  SP.state.playing = false;
+  SP._maybeRecord(0);
+  ok(SP.state.pattern[0].every(function (v) { return !v; }), "armed but stopped: pad hits do not record");
+  // record while playing: hit lands on the sounding step (step 0, empty history)
+  SP.state.playing = true;
+  SP._maybeRecord(0);
+  ok(SP.state.pattern[0][0] === 1, "armed + playing: pad hit punches into the current step");
+  ok(ui.stepBtns[0][0].classList.contains("on"), "recorded step lights in the grid");
+  const recsaved = JSON.parse(sandbox.localStorage.getItem("sp1200"));
+  ok(recsaved.pattern[0][0] === 1, "recorded hit persists to localStorage");
+  // live pad trigger records through playPad; scheduled + audition hits do not
+  SP._playPad(3);
+  ok(SP.state.pattern[3][0] === 1, "live playPad hit records while armed");
+  const before2 = SP.state.pattern[2].join(",");
+  SP._playPad(2, 0);
+  ok(SP.state.pattern[2].join(",") === before2, "scheduled pattern playback never records");
+  const before1 = SP.state.pattern[1].join(",");
+  SP._playPad(1, null, null, true);
+  ok(SP.state.pattern[1].join(",") === before1, "sample auditions never record");
+  SP._toggleRec();
+  SP.state.playing = false;
+  ok(SP._recArmed() === false, "REC disarmed after the record tests");
+
   console.log("\nui: " + n + " passed");
 })().catch(function (e) { console.error("TAPE TESTS FAILED:", e); process.exit(1); });
