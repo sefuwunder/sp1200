@@ -18,6 +18,23 @@
     { id: "shaker", name: "SHAKER", key: "8" },
   ];
   var STEPS = 16;
+  var PAD_LABEL_MAX = 12;
+
+  // ---- pad names: user label wins, then sample name, then the built-in drum ----
+  function sanitizePadLabel(s) {
+    var t = String(s == null ? "" : s).replace(/[\r\n\t]/g, " ").replace(/\s{2,}/g, " ").trim().toUpperCase();
+    return t.slice(0, PAD_LABEL_MAX);
+  }
+  function padLabel(p) { return p.label || p.customName || p.def.name; }
+  // paintPadName is only called after boot, when ui exists
+  function paintPadName(i) {
+    var p = state.pads[i];
+    if (!p) return;
+    var name = padLabel(p);
+    if (ui.padNames[i]) ui.padNames[i].textContent = name;
+    if (ui.seqNameLabels && ui.seqNameLabels[i]) ui.seqNameLabels[i].textContent = name;
+    if (ui.padBtns[i]) ui.padBtns[i].setAttribute("aria-label", "Trigger " + name);
+  }
 
   // steps are 0/1 arrays; index = pad order above
   var PRESETS = {
@@ -180,6 +197,7 @@
     state.pads[i].tune = clamp(ps.tune || 1, 0.5, 2);
     state.pads[i].level = clamp(ps.level == null ? 0.9 : ps.level, 0, 1);
     state.pads[i].muted = !!ps.muted;
+    state.pads[i].label = (typeof ps.label === "string" && sanitizePadLabel(ps.label)) || null;
     if (ps.filterType && FILTER_TYPES.indexOf(ps.filterType) >= 0) state.pads[i].filterType = ps.filterType;
     if (typeof ps.filterFreq === "number") state.pads[i].filterFreq = clamp(ps.filterFreq, FREQ_MIN, FREQ_MAX);
     if (typeof ps.filterQ === "number") state.pads[i].filterQ = clamp(ps.filterQ, 0.5, 8);
@@ -200,7 +218,7 @@
       filterType: p.filterType, filterFreq: p.filterFreq, filterQ: p.filterQ,
       voiceMode: p.voiceMode, choke: p.choke,
       delay: { on: p.delay.on, time: p.delay.time, feedback: p.delay.feedback, mix: p.delay.mix },
-      custom: null,
+      custom: null, label: p.label || null,
     };
     if (p.customName && p.dataClean) o.custom = { name: p.customName, pcm: f32ToPcm16B64(p.dataClean) };
     return o;
@@ -879,6 +897,75 @@
     try { rd.readAsText(file); } catch (e) { projMsg("IMPORT FAILED - UNREADABLE"); }
   }
 
+  // ---------------- global pad renaming ----------------
+  // One panel to rename all 8 pads in one place. The user label sticks with
+  // the project (saved per pad) and wins over the sample name everywhere the
+  // pad name is shown: pads, step composer rows, sample editor title.
+  var nmOv = null; // lazily built rename overlay handles { root, inputs }
+  function renamePad(i, name) {
+    var p = state.pads[i];
+    if (!p) return;
+    p.label = sanitizePadLabel(name) || null;
+    paintPadName(i);
+    if (ui.edOpenFor === i) syncEditor();
+    save();
+  }
+  function renamePads(names) {
+    var ns = names || [];
+    for (var i = 0; i < state.pads.length; i++)
+      state.pads[i].label = sanitizePadLabel(ns[i]) || null;
+    for (var j = 0; j < state.pads.length; j++) paintPadName(j);
+    if (ui.edOpenFor != null && ui.edOpenFor >= 0) syncEditor();
+    save();
+  }
+  function buildNames() {
+    var root = el("div", "overlay", document.body);
+    root.style.display = "none";
+    var panel = el("div", "editor names-panel", root);
+    var head = el("div", "ed-head", panel);
+    var title = el("div", "ed-title", head); title.textContent = "PAD NAMES";
+    var x = el("button", "btn", head);
+    x.textContent = "\u00d7";
+    x.setAttribute("aria-label", "Close pad rename panel");
+    x.addEventListener("click", closeNames);
+    root.addEventListener("click", function (e) { if (e.target === root) closeNames(); });
+    var sub = el("div", "names-sub", panel);
+    sub.textContent = "RENAME ALL 8 PADS IN ONE PLACE \u2014 NAMES STICK WITH THE PROJECT";
+    var rows = el("div", "names-rows", panel);
+    var inputs = [];
+    PAD_DEFS.forEach(function (def, i) {
+      var row = el("div", "names-row", rows);
+      var badge = el("span", "names-key", row); badge.textContent = def.key;
+      var inp = el("input", "names-input", row);
+      inp.type = "text"; inp.maxLength = PAD_LABEL_MAX; inp.spellcheck = false;
+      inp.autocomplete = "off";
+      inp.setAttribute("aria-label", "Rename pad " + (i + 1) + " (" + def.name + ")");
+      inp.addEventListener("input", function () { renamePad(i, inp.value); });
+      inp.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") { e.preventDefault(); closeNames(); }
+        else if (e.key === "Escape") closeNames();
+      });
+      inputs.push(inp);
+    });
+    var ops = el("div", "ed-ops", panel);
+    var reset = el("button", "btn", ops); reset.textContent = "RESET ALL";
+    reset.setAttribute("aria-label", "Reset all pad names to defaults");
+    reset.addEventListener("click", function () { renamePads([]); syncNamesInputs(); });
+    var done = el("button", "btn", ops); done.textContent = "DONE";
+    done.addEventListener("click", closeNames);
+    nmOv = { root: root, inputs: inputs };
+  }
+  function syncNamesInputs() {
+    if (!nmOv) return;
+    nmOv.inputs.forEach(function (inp, i) { inp.value = padLabel(state.pads[i]); });
+  }
+  function openNames() {
+    if (!nmOv) buildNames();
+    syncNamesInputs();
+    nmOv.root.style.display = "";
+  }
+  function closeNames() { if (nmOv) nmOv.root.style.display = "none"; }
+
   // ---------------- custom samples ----------------
   // Put raw mono float samples through the SP path onto a pad.
   function assignSampleToPad(padIdx, ch, sampleRate, name) {
@@ -889,7 +976,7 @@
     var clean = DSP.resampleLinear(ch, sampleRate, DSP.SYNTH_RATE);
     p.dataClean = DSP.normalize(clean, 0.92);
     p.customName = (name || "sample").replace(/\.\w+$/, "").slice(0, 12).toUpperCase();
-    ui.padNames[padIdx].textContent = p.customName;
+    paintPadName(padIdx);
     p._undo = null;
     p.selStart = 0; p.selEnd = 1;
     if (ui.edOpenFor === padIdx) syncEditor();
@@ -975,12 +1062,13 @@
     p.dataSP = DSP.SYNTHS[p.def.id]();
     p.dataClean = DSP.SYNTHS_RAW[p.def.id]();
     p.customName = null;
+    p.label = null;
     p._undo = null;
     p.selStart = 0; p.selEnd = 1;
     setFilterType(padIdx, "off");
     p.filterFreq = FREQ_MAX; p.filterQ = 0.8;
     if (ui.edOpenFor === padIdx) syncEditor();
-    ui.padNames[padIdx].textContent = p.def.name;
+    paintPadName(padIdx);
     save();
   }
 
@@ -1189,7 +1277,7 @@
     // refresh the editor for the currently open pad (after load/reset)
     if (!ed || ui.edOpenFor == null || ui.edOpenFor < 0) return;
     var p = state.pads[ui.edOpenFor];
-    ed.title.textContent = "SAMPLE EDIT — " + (p.customName || p.def.name);
+    ed.title.textContent = "SAMPLE EDIT — " + padLabel(p);
     paintFilterTypes();
     ed.cutoff.set(freqToSlider(p.filterFreq));
     ed.reso.set(p.filterQ * 10);
@@ -1794,7 +1882,7 @@
     p.dataClean = cut;
     refreshSample(padIdx); // re-derive the 12-bit SP buffer
     p.customName = ("SLC " + (sl.selSeg + 1)).slice(0, 12).toUpperCase();
-    ui.padNames[padIdx].textContent = p.customName;
+    paintPadName(padIdx);
     p.selStart = 0; p.selEnd = 1;
     playPad(padIdx); // audition the chop through the SP path
     save();
@@ -2083,6 +2171,11 @@
 
     // ---- pads: SOUND ----
     var pt = el("div", "section-title", app); pt.textContent = "SOUND";
+    var namesBtn = el("button", "btn names-btn", pt);
+    namesBtn.textContent = "NAMES";
+    namesBtn.title = "Rename all 8 pads in one place";
+    namesBtn.setAttribute("aria-label", "Rename pads");
+    namesBtn.addEventListener("click", openNames);
     var padsEl = el("div", "pads", app);
     ui.padBtns = []; ui.padNames = []; ui.padCards = [];
 
@@ -2193,7 +2286,7 @@
     var slash = el("small", "", digits); slash.textContent = " / 16";
     el("span", "play-dot", lcd);
     ui.koMeta = el("div", "meta", lcd);
-    ui.seqRows = []; ui.seqMutes = []; ui.stepBtns = [];
+    ui.seqRows = []; ui.seqMutes = []; ui.stepBtns = []; ui.seqNameLabels = [];
 
     PAD_DEFS.forEach(function (def, i) {
       keysMode[i] = false;
@@ -2203,6 +2296,7 @@
       lab.title = "Toggle KEYS mode: play this voice chromatically";
       lab.setAttribute("role", "button");
       var labName = el("span", "", lab); labName.textContent = def.name;
+      ui.seqNameLabels.push(labName);
       var ktag = el("span", "keys-tag", lab); ktag.textContent = "KEYS";
       lab.addEventListener("click", function (e) {
         if (e.target && e.target.tagName === "BUTTON") return; // mute key keeps its job
@@ -2409,7 +2503,7 @@
       setFilterType(i, p.filterType);
       paintVoiceMode(i);
       paintChoke(i);
-      ui.padNames[i].textContent = p.customName || p.def.name;
+      paintPadName(i);
       ui.padCards[i].classList.toggle("muted", p.muted);
       ui.seqRows[i].classList.toggle("muted", p.muted);
       ui.seqMutes[i].classList.toggle("on", p.muted);
@@ -2427,7 +2521,7 @@
         def: def,
         dataSP: DSP.SYNTHS[def.id](),
         dataClean: DSP.SYNTHS_RAW[def.id](),
-        tune: 1, level: 0.9, muted: false, customName: null,
+        tune: 1, level: 0.9, muted: false, customName: null, label: null,
         filterType: "off", filterFreq: FREQ_MAX, filterQ: 0.8,
         voiceMode: "poly",
         choke: (def.id === "chat" || def.id === "ohat") ? 1 : 0,  // 0=off, 1..3 = groups A/B/C
@@ -2494,6 +2588,11 @@
     _exportProject: exportProject, _importProjectFile: importProjectFile,
     _projectFileName: projectFileName,
     _serializeProject: serializeProject, _syncUI: syncUIFromState,
+    _renamePad: renamePad, _renamePads: renamePads,
+    _padLabel: function (i) { return padLabel(state.pads[i]); },
+    _openNames: openNames, _closeNames: closeNames,
+    _namesOpen: function () { return !!(nmOv && nmOv.root.style.display !== "none"); },
+    _sanitizePadLabel: sanitizePadLabel,
     _f32ToPcm16B64: f32ToPcm16B64, _pcm16B64ToF32: pcm16B64ToF32 };
   if (typeof window !== "undefined") window.SP1200 = api;
   else globalThis.SP1200 = api;

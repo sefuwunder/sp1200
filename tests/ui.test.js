@@ -824,5 +824,35 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
   SP._fitViewport();
   ok(true, "fitViewport runs without error");
 
+  // ---- global pad renaming ----
+  ok(SP._sanitizePadLabel("  deep kick  ") === "DEEP KICK", "rename sanitizes: trims + uppercases");
+  ok(SP._sanitizePadLabel("averyverylongname").length === 12, "rename truncates to 12 chars");
+  ok(SP._sanitizePadLabel("   ") === "", "blank rename sanitizes to empty");
+  ok(SP._padLabel(0) === "KICK", "default pad label is the built-in drum name");
+  SP._renamePad(0, "boom");
+  ok(SP.state.pads[0].label === "BOOM", "renamePad stores the sanitized user label");
+  ok(SP._padLabel(0) === "BOOM", "user label wins for the pad label");
+  ok(ui.padNames[0].textContent === "BOOM", "pad strip shows the renamed label");
+  ok(ui.seqNameLabels[0].textContent === "BOOM", "step composer row shows the renamed label");
+  SP.state.pads[2].customName = "SAMPLE";
+  SP._renamePad(2, "my chop");
+  ok(SP._padLabel(2) === "MY CHOP", "user label wins over the sample name");
+  SP._renamePad(2, "   ");
+  ok(SP.state.pads[2].label === null && SP._padLabel(2) === "SAMPLE", "blank rename clears back to the sample name");
+  SP.state.pads[2].customName = null;
+  SP._renamePads(["a", "b", "c", "d", "e", "f", "g", "h"]);
+  ok(SP.state.pads.every(function (p, i) { return p.label === "ABCDEFGH"[i]; }), "renamePads renames all 8 pads at once");
+  ok(ui.padNames[7].textContent === "H" && ui.seqNameLabels[7].textContent === "H", "batch rename repaints pads + sequencer rows");
+  const rsaved = JSON.parse(sandbox.localStorage.getItem("sp1200"));
+  ok(rsaved.pads[0].label === "A" && rsaved.pads[7].label === "H", "pad labels persist to localStorage");
+  ok(SP._serializeProject("t").pads[3].label === "D", "pad labels ride along in project export");
+  SP._openNames();
+  ok(SP._namesOpen() === true, "rename overlay opens");
+  SP._closeNames();
+  ok(SP._namesOpen() === false, "rename overlay closes");
+  SP._renamePads([]);
+  ok(SP.state.pads.every(function (p) { return p.label === null; }), "renamePads([]) resets every pad to its default name");
+  ok(SP._padLabel(0) === "KICK" && ui.padNames[0].textContent === "KICK", "reset restores the built-in names everywhere");
+
   console.log("\nui: " + n + " passed");
 })().catch(function (e) { console.error("TAPE TESTS FAILED:", e); process.exit(1); });
