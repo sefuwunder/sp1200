@@ -197,13 +197,16 @@
     return out;
   }
 
-  function applyScalars(s) {
+  // includePattern=false for project slots: a saved project is the kit
+  // (pads, tapes, tempo/feel) — loading one must never clobber the step
+  // sequencer. The session autosave is the only thing that restores steps.
+  function applyScalars(s, includePattern) {
     if (!s) return;
     if (s.bpm) state.bpm = clamp(s.bpm, 60, 200);
     if (s.swing) state.swing = clamp(s.swing, 50, 75);
     if (typeof s.master === "number") state.master = clamp(s.master, 0, 100);
     if (typeof s.spMode === "boolean") state.spMode = s.spMode;
-    if (Array.isArray(s.pattern) && s.pattern.length === PAD_DEFS.length) {
+    if (includePattern !== false && Array.isArray(s.pattern) && s.pattern.length === PAD_DEFS.length) {
       state.pattern = s.pattern.map(function (row) {
         var r = new Array(STEPS).fill(0);
         if (Array.isArray(row)) for (var i = 0; i < Math.min(row.length, STEPS); i++) r[i] = row[i] ? 1 : 0;
@@ -802,11 +805,13 @@
     if (buf.numberOfChannels > 1) buf.getChannelData(1).set(f.subarray(a.len, a.len * 2));
     return buf;
   }
+  // A project slot holds the kit — pads, tapes, tempo/feel — never the step
+  // sequencer pattern. The pattern lives in the session autosave only, so
+  // loading a slot can't wipe the notes you just programmed.
   function serializeProject(name) {
     return {
       version: 1, name: name, savedAt: Date.now(),
       bpm: state.bpm, swing: state.swing, master: state.master, spMode: state.spMode,
-      pattern: state.pattern.map(function (row) { return row.slice(); }),
       pads: state.pads.map(function (p, i) { return padSettings(i); }),
       tapes: state.tapes.map(tapeToSaved),
       tapeBars: ui.tapeBars || 2,
@@ -826,7 +831,7 @@
       var raw = localStorage.getItem(slotLSKey(i));
       if (!raw) return false;
       var p = JSON.parse(raw);
-      return !!(p && p.version === 1 && Array.isArray(p.pattern));
+      return !!(p && p.version === 1 && Array.isArray(p.pads));
     } catch (e) { return false; }
   }
   function paintSlots() {
@@ -883,7 +888,7 @@
   }
   function loadProjectData(proj) {
     panic();
-    applyScalars(proj);
+    applyScalars(proj, false); // project slots never touch the step sequencer
     (proj.pads || []).forEach(function (ps, i) {
       applyPadSettings(i, ps);
       var p = state.pads[i];
@@ -960,7 +965,9 @@
       var proj;
       try {
         proj = JSON.parse(rd.result);
-        if (!proj || proj.version !== 1 || !Array.isArray(proj.pattern)) throw 0;
+        // projects saved before the pattern was split out still carry one —
+        // it's ignored on load, pads are what matter
+        if (!proj || proj.version !== 1 || !Array.isArray(proj.pads)) throw 0;
       } catch (e) { projMsg("IMPORT FAILED - BAD FILE"); return; }
       loadProjectData(proj);
       currentSlot = -1;
@@ -2557,7 +2564,7 @@
     var pOps = el("div", "proj-ops", pm);
     ui.storeBtn = el("button", "btn", pOps);
     ui.storeBtn.textContent = "STORE";
-    ui.storeBtn.title = "Arm, then tap a slot 4-9 to save the current state";
+    ui.storeBtn.title = "Arm, then tap a slot 4-9 to save the current kit (step pattern is not stored)";
     ui.storeBtn.setAttribute("aria-label", "Arm project store");
     ui.storeBtn.addEventListener("click", function () {
       storeArmed = !storeArmed;

@@ -726,9 +726,11 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
   ok(ui.projKeys[3].classList.contains("filled"), "filled slot key shows its dot");
   ok(ui.projMsg.textContent === "STORED -> SLOT 4", "store reports its slot");
 
-  // mutate everything, then load the slot
+  // mutate everything, then load the slot — plant a distinctive pattern
+  // that the slot load must NOT touch
   SP.state.bpm = 60; SP.state.swing = 50; SP.state.master = 80; SP.state.spMode = true;
   SP.state.pattern.forEach(function (row) { row.fill(0); });
+  SP.state.pattern[1][1] = 1; SP.state.pattern[6][9] = 1;
   sp0.tune = 1; sp0.muted = false; sp0.filterType = "off"; sp0.voiceMode = "poly"; sp0.delay.on = false;
   sp1.dataClean = new Float32Array([0]); sp1.customName = null;
   SP._tapeStopAll();
@@ -736,7 +738,9 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
   SP._loadSlot(3);
   ok(SP.state.bpm === 100, "slot load restores bpm");
   ok(SP.state.swing === 70 && SP.state.master === 64 && SP.state.spMode === false, "slot load restores transport scalars");
-  ok(SP.state.pattern[3][5] === 1 && SP.state.pattern[7][15] === 1 && SP.state.pattern[0][0] === 0, "slot load restores the pattern");
+  ok(SP.state.pattern[1][1] === 1 && SP.state.pattern[6][9] === 1, "slot load leaves the current pattern untouched");
+  ok(SP.state.pattern[3][5] === 0 && SP.state.pattern[7][15] === 0, "slot load does not restore the stored pattern");
+  ok(!("pattern" in SP._serializeProject("t")), "saved projects carry no step pattern");
   const q0 = SP.state.pads[0];
   ok(Math.abs(q0.tune - 1.5) < 1e-9 && q0.muted === true && q0.filterType === "lowpass" &&
      q0.filterFreq === 800 && q0.filterQ === 2, "slot load restores pad strip settings");
@@ -750,8 +754,9 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
   const qt = SP.state.tapes[0];
   ok(!!(qt.buffer && qt.buffer.getChannelData(0).length === tapeLen), "slot load restores tape audio");
   // UI follows the loaded state
-  ok(ui.stepBtns[3][5].classList.contains("on") && ui.stepBtns[7][15].classList.contains("on"), "loaded pattern shows on the grid");
-  ok(!ui.stepBtns[0][0].classList.contains("on"), "cleared steps stay off on the grid");
+  SP._syncUI();
+  ok(ui.stepBtns[1][1].classList.contains("on") && ui.stepBtns[6][9].classList.contains("on"), "grid keeps the current pattern after slot load");
+  ok(!ui.stepBtns[3][5].classList.contains("on"), "stored pattern does not leak onto the grid");
   ok(ui.padNames[1].textContent === "MYSMPL", "loaded custom name shows on the strip");
   ok(ui.padNames[0].textContent === SP.state.pads[0].def.name, "built-in pad name restores on the strip");
 
@@ -793,16 +798,24 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
   ok(dlCapture.type === "application/json", "export is typed as JSON");
   const exported = JSON.parse(dlCapture.parts[0]);
   ok(exported.version === 1, "exported payload carries the version");
-  ok(exported.bpm === 97 && exported.pattern[2][7] === 1, "exported payload carries the project state");
+  ok(exported.bpm === 97 && !("pattern" in exported), "exported payload carries the project state without the pattern");
   ok(ui.projMsg.textContent.indexOf("EXPORTED") === 0, "export reports its status");
   // mutate, then import the file back
   SP.state.bpm = 60;
   SP.state.pattern.forEach(function (row) { row.fill(0); });
+  SP.state.pattern[5][5] = 1; // distinctive pattern the import must not touch
   SP._importProjectFile({ _text: dlCapture.parts[0], name: "slot-5.sp1200.json" });
   ok(SP.state.bpm === 97, "import restores bpm from the file");
-  ok(SP.state.pattern[2][7] === 1 && SP.state.pattern[0][0] === 0, "import restores the pattern from the file");
-  ok(ui.stepBtns[2][7].classList.contains("on"), "imported pattern shows on the grid");
+  ok(SP.state.pattern[5][5] === 1 && SP.state.pattern[2][7] === 0, "import leaves the step pattern untouched");
   ok(ui.projMsg.textContent.indexOf("IMPORTED") === 0, "import reports its status");
+  // old project files (with a pattern baked in) still import; the pattern is ignored
+  const legacy = JSON.parse(dlCapture.parts[0]);
+  legacy.pattern = SP.state.pattern.map(function (row) { return row.slice(); });
+  legacy.pattern[0][0] = 1;
+  SP.state.pattern.forEach(function (row) { row.fill(0); });
+  SP.state.pattern[4][4] = 1;
+  SP._importProjectFile({ _text: JSON.stringify(legacy), name: "legacy.sp1200.json" });
+  ok(SP.state.pattern[4][4] === 1 && SP.state.pattern[0][0] === 0, "legacy file imports without touching the pattern");
   // corrupt file
   SP._importProjectFile({ _text: "{nope", name: "bad.json" });
   ok(ui.projMsg.textContent === "IMPORT FAILED - BAD FILE", "corrupt import is rejected cleanly");
