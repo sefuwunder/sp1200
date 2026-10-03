@@ -136,3 +136,21 @@ function burstAt(sr, durSec, atSec, amp) {
 }
 
 console.log("\ndsp: " + n + " passed");
+
+// ---- int16 memory path ----
+{
+  const x = new Float32Array([2, -2, 0.5, -0.25, 0]);
+  const q = DSP.quantize12i16(x);
+  ok(q instanceof Int16Array, "quantize12i16 returns Int16Array");
+  ok(q[0] === 2047 && q[1] === -2047 && q[2] === 1024, "quantize12i16 clamps and scales to the 12-bit grid");
+  ok(q.byteLength === x.length * 2, "quantize12i16 uses 2 bytes/sample (half of Float32Array)");
+  const det = new Float32Array(512).map((_, i) => Math.sin(i * 0.13) * 0.8);
+  const a = DSP.quantize12(det), b = DSP.quantize12i16(det);
+  let max = 0;
+  for (let i = 0; i < det.length; i++) max = Math.max(max, Math.abs(a[i] - b[i] / 2047));
+  ok(max < 1e-6, "quantize12i16 matches quantize12 within rounding");
+  const s = DSP.SYNTHS_I16.kick();
+  ok(s instanceof Int16Array && s.length === DSP.SYNTHS.kick().length, "SYNTHS_I16 mirrors SYNTHS shape as Int16Array");
+  const z = DSP.sp1200izeI16(new Float32Array(44100).fill(0.5), 44100);
+  ok(z instanceof Int16Array && z.length > 20000 && z.length < 30000, "sp1200izeI16 resamples to ~26.04 kHz as Int16Array");
+}

@@ -156,6 +156,25 @@
     }
     return out;
   }
+  // Float32Array <-> Int16Array, full-range 16-bit. Used for undo levels and
+  // the tape undo stack: 2 bytes/sample instead of 4, sonically transparent
+  // here (the SP path is 12-bit anyway, projects persist as 16-bit PCM).
+  function f32ToI16(data) {
+    var out = new Int16Array(data.length);
+    for (var i = 0; i < data.length; i++) {
+      var v = data[i] < -1 ? -1 : data[i] > 1 ? 1 : data[i];
+      out[i] = v < 0 ? Math.round(v * 32768) : Math.round(v * 32767);
+    }
+    return out;
+  }
+  function i16ToF32(data) {
+    var out = new Float32Array(data.length);
+    for (var i = 0; i < data.length; i++) {
+      var s = data[i];
+      out[i] = s < 0 ? s / 32768 : s / 32767;
+    }
+    return out;
+  }
   // Float32Array <-> base64 of 16-bit PCM (halves the size of float storage)
   function f32ToPcm16B64(data) {
     var bytes = new Uint8Array(data.length * 2);
@@ -444,10 +463,7 @@
     // Mono: retriggering cuts this pad's own tail.
     if (p.voiceMode === "mono") killStoreVoices(VS[idx], t0);
     var useSP = state.spMode;
-    var data = useSP ? p.dataSP : p.dataClean;
-    var rate = useSP ? DSP.SP_RATE : DSP.SYNTH_RATE;
-    var buf = ac.createBuffer(1, data.length, rate);
-    buf.copyToChannel(data, 0);
+    var buf = padBuffer(ac, p, useSP);
     var src = ac.createBufferSource();
     src.buffer = buf;
     src.playbackRate.value = p.tune * (rateMul || 1); // varispeed, exactly like the hardware
@@ -864,7 +880,7 @@
           p.customName = ps.custom.name || "SAMPLE";
         } catch (e) { resetPad(i); }
       } else {
-        p.dataSP = DSP.SYNTHS[p.def.id]();
+        p.dataSP = DSP.SYNTHS_I16[p.def.id]();
         p.dataClean = DSP.SYNTHS_RAW[p.def.id]();
         p.customName = null;
       }
@@ -1014,9 +1030,10 @@
     var p = state.pads[padIdx];
     var sp = DSP.resampleLinear(ch, sampleRate, DSP.SP_RATE);
     DSP.normalize(sp, 0.92);
-    p.dataSP = DSP.quantize12(sp);
+    p.dataSP = DSP.quantize12i16(sp);
     var clean = DSP.resampleLinear(ch, sampleRate, DSP.SYNTH_RATE);
     p.dataClean = DSP.normalize(clean, 0.92);
+    invalidatePadBuffers(p);
     p.customName = (name || "sample").replace(/\.\w+$/, "").slice(0, 12).toUpperCase();
     paintPadName(padIdx);
     p._undo = null;
@@ -1101,8 +1118,9 @@
   }
   function resetPad(padIdx) {
     var p = state.pads[padIdx];
-    p.dataSP = DSP.SYNTHS[p.def.id]();
+    p.dataSP = DSP.SYNTHS_I16[p.def.id]();
     p.dataClean = DSP.SYNTHS_RAW[p.def.id]();
+    invalidatePadBuffers(p);
     p.customName = null;
     p.label = null;
     p._undo = null;
@@ -1150,13 +1168,38 @@
   function refreshSample(i) {
     var p = state.pads[i];
     var sp = DSP.resampleLinear(p.dataClean, DSP.SYNTH_RATE, DSP.SP_RATE);
-    p.dataSP = DSP.quantize12(sp);
+    p.dataSP = DSP.quantize12i16(sp);
+    invalidatePadBuffers(p);
   }
+  // Per-pad AudioBuffer cache. playPad used to allocate a fresh AudioBuffer
+  // and copy the entire sample on EVERY trigger — multi-MB alloc + GC churn
+  // with long samples. Buffers are built once per sample/mode and reused;
+  // any sample change clears them (see refreshSample + the LOAD/reset paths).
+  function padBuffer(ac, p, useSP) {
+    var key = useSP ? "_bufSP" : "_bufClean";
+    if (p[key]) return p[key];
+    var src = useSP ? p.dataSP : p.dataClean;
+    var buf = ac.createBuffer(1, src.length, useSP ? DSP.SP_RATE : DSP.SYNTH_RATE);
+    var ch = buf.getChannelData(0);
+    if (useSP) {
+      for (var i = 0; i < src.length; i++) ch[i] = src[i] / 2047; // int16 12-bit → float
+    } else {
+      ch.set(src);
+    }
+    p[key] = buf;
+    return buf;
+  }
+  function invalidatePadBuffers(p) {
+    p._bufSP = null; p._bufClean = null;
+  }
+  // Undo levels are stored as Int16Array (2 bytes/sample): a 30 s sample's
+  // 10-deep float undo stack was ~53 MB per pad; 6 int16 levels are ~16 MB.
+  var UNDO_DEPTH = 6;
   function pushUndo(p) {
     if (p.dataClean.length > 2000000) return; // skip huge samples
     if (!p._undo) p._undo = [];
-    p._undo.push(p.dataClean.slice());
-    if (p._undo.length > 10) p._undo.shift();
+    p._undo.push(f32ToI16(p.dataClean));
+    if (p._undo.length > UNDO_DEPTH) p._undo.shift();
   }
   function commitEdit(i) {
     var p = state.pads[i];
@@ -1252,7 +1295,7 @@
     opBtn("UNDO", function () {
       var i = ui.edOpenFor, p = state.pads[i];
       if (p._undo && p._undo.length) {
-        p.dataClean = p._undo.pop();
+        p.dataClean = i16ToF32(p._undo.pop());
         commitEdit(i);
       }
     }, "Undo last edit");
@@ -1851,11 +1894,12 @@
     }
   }
 
-  // Destructive tape ops (trim/crop/clear) push the pre-op state here.
+  // Destructive tape ops (trim/crop/clear) push the pre-op state here, as
+  // Int16Array for the same reason as pad undo.
   function pushTapeUndo() {
     if (!sl || !sl.tape) return;
     sl.tapeUndo.push({
-      tape: sl.tape.slice(), markers: sl.markers.slice(),
+      tape: f32ToI16(sl.tape), markers: sl.markers.slice(),
       tapeName: sl.tapeName, selSeg: sl.selSeg,
     });
     if (sl.tapeUndo.length > 12) sl.tapeUndo.shift();
@@ -1864,7 +1908,7 @@
     if (!sl || !sl.tapeUndo.length) return;
     stopSlicerAudition();
     var u = sl.tapeUndo.pop();
-    sl.tape = u.tape; sl.markers = u.markers; sl.tapeName = u.tapeName;
+    sl.tape = i16ToF32(u.tape); sl.markers = u.markers; sl.tapeName = u.tapeName;
     sl.selSeg = Math.min(u.selSeg, Math.max(0, slicerSegments().length - 1));
     buildTapePeaks();
     syncSlicer();
@@ -2570,7 +2614,7 @@
     PAD_DEFS.forEach(function (def) {
       state.pads.push({
         def: def,
-        dataSP: DSP.SYNTHS[def.id](),
+        dataSP: DSP.SYNTHS_I16[def.id](),
         dataClean: DSP.SYNTHS_RAW[def.id](),
         tune: 1, level: 0.9, muted: false, customName: null, label: null,
         filterType: "off", filterFreq: FREQ_MAX, filterQ: 0.8,
@@ -2620,6 +2664,8 @@
     _setFilterType: setFilterType, _cycleFilter: cycleFilter,
     _openEditor: openEditor, _closeEditor: closeEditor,
     _refreshSample: refreshSample, _drawWave: drawWave,
+    _padBuffer: padBuffer, _invalidatePadBuffers: invalidatePadBuffers,
+    _f32ToI16: f32ToI16, _i16ToF32: i16ToF32, _pushUndo: pushUndo,
     _openSlicer: openSlicer, _closeSlicer: closeSlicer,
     _slicerSetTape: slicerSetTape, _slicerEqual: slicerEqual, _slicerAuto: slicerAuto,
     _slicerSegments: slicerSegments, _auditionSegment: auditionSegment, _sliceToPad: sliceToPad,

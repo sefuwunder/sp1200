@@ -80,9 +80,25 @@
     return out;
   }
 
+  // Memory-light twin: the same 12-bit values as an Int16Array (2 bytes per
+  // sample instead of 4). Divide by 2047 to get back to float.
+  function quantize12i16(input) {
+    const out = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+      const v = Math.max(-1, Math.min(1, input[i]));
+      out[i] = Math.round(v * 2047);
+    }
+    return out;
+  }
+
   // Run clean audio through the SP-1200's converters: 26.04 kHz, 12-bit.
   function sp1200ize(input, fromRate) {
     return quantize12(resampleLinear(input, fromRate, SP_RATE));
+  }
+
+  // Int16 twin of sp1200ize (see quantize12i16).
+  function sp1200izeI16(input, fromRate) {
+    return quantize12i16(resampleLinear(input, fromRate, SP_RATE));
   }
 
   // ---------- drum synthesis (clean, then sampled by the SP path) ----------
@@ -197,6 +213,18 @@
     chat: synthClosedHat, ohat: synthOpenHat, tom: synthTom, shaker: synthShaker,
   };
 
+  // Int16 twins of SYNTHS (2 bytes/sample). Divide by 2047 for float.
+  const SYNTHS_I16 = {
+    kick: () => sp1200izeI16(synthKickRaw(), SYNTH_RATE),
+    snare: () => sp1200izeI16(synthSnareRaw(), SYNTH_RATE),
+    clap: () => sp1200izeI16(synthClapRaw(), SYNTH_RATE),
+    rim: () => sp1200izeI16(synthRimRaw(), SYNTH_RATE),
+    chat: () => sp1200izeI16(synthClosedHatRaw(), SYNTH_RATE),
+    ohat: () => sp1200izeI16(synthOpenHatRaw(), SYNTH_RATE),
+    tom: () => sp1200izeI16(synthTomRaw(), SYNTH_RATE),
+    shaker: () => sp1200izeI16(synthShakerRaw(), SYNTH_RATE),
+  };
+
   // ---------- swing ----------
 
   // Duration of one 16th note in seconds.
@@ -280,8 +308,8 @@
   }
 
   return {
-    SP_RATE, SP_BITS, SYNTH_RATE, SYNTHS, SYNTHS_RAW,
-    resampleLinear, quantize12, sp1200ize,
+    SP_RATE, SP_BITS, SYNTH_RATE, SYNTHS, SYNTHS_RAW, SYNTHS_I16,
+    resampleLinear, quantize12, quantize12i16, sp1200ize, sp1200izeI16,
     lowpass, highpass, normalize,
     trimSample, reverseSample, fadeSample,
     detectOnsets,

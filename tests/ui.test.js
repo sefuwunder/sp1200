@@ -272,7 +272,7 @@ p.dataClean = sandbox.DSP.trimSample(p.dataClean, 0.25, 0.75);
 SP._refreshSample(3);
 ok(p.dataClean.length === 4, "trimmed clean sample is kept");
 ok(p.dataSP.length > 0 && p.dataSP.length < 8, "12-bit SP buffer re-derived from the edited sample");
-ok(Object.prototype.toString.call(p.dataSP) === "[object Float32Array]", "re-derived SP buffer is a Float32Array");
+ok(Object.prototype.toString.call(p.dataSP) === "[object Int16Array]", "re-derived SP buffer is an Int16Array (12-bit, 2 bytes/sample)");
 
 // ---- sequencer still schedules ----
 SP._scheduleStep(0, 0);
@@ -349,7 +349,7 @@ const p2 = SP.state.pads[2];
 ok(p2.customName === "SLC 2", "loaded chop is named after the selected segment");
 ok(ui.padNames[2].textContent === "SLC 2", "pad strip label follows the chop");
 ok(p2.dataClean.length !== before, "pad sample replaced by the segment");
-ok(Object.prototype.toString.call(p2.dataSP) === "[object Float32Array]" && p2.dataSP.length > 0, "12-bit SP buffer re-derived for the chop");
+ok(Object.prototype.toString.call(p2.dataSP) === "[object Int16Array]" && p2.dataSP.length > 0, "12-bit SP buffer re-derived for the chop");
 ok(p2._undo && p2._undo.length === 1, "chop load is undoable in the editor");
 
 // TRIM tightens the selected segment to the audio
@@ -895,3 +895,62 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
 
   console.log("\nui: " + n + " passed");
 })().catch(function (e) { console.error("TAPE TESTS FAILED:", e); process.exit(1); });
+
+// ---- memory: int16 undo round-trip ----
+{
+  const p = SP.state.pads[4];
+  const orig = new Float32Array([0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8]);
+  p.dataClean = Float32Array.from(orig);
+  p._undo = null;
+  SP._pushUndo(p);
+  ok((p._undo || []).length === 1, "pushUndo stores one level");
+  const level = p._undo[0];
+  ok(Object.prototype.toString.call(level) === "[object Int16Array]", "undo level stored as Int16Array (2 bytes/sample)");
+  ok(level.length === orig.length, "undo level keeps full length");
+  ok(level.byteLength === orig.length * 2, "undo level is half the bytes of a float copy");
+  // simulate an edit, then undo via the int16 path
+  p.dataClean = new Float32Array(orig.length).fill(0.9);
+  p.dataClean = SP._i16ToF32(p._undo.pop());
+  let maxDiff = 0;
+  for (let i = 0; i < orig.length; i++) maxDiff = Math.max(maxDiff, Math.abs(p.dataClean[i] - orig[i]));
+  ok(maxDiff < 1 / 32767 + 1e-6, "undo restores the sample within 16-bit rounding");
+  // depth cap
+  p._undo = null;
+  for (let i = 0; i < 10; i++) SP._pushUndo(p);
+  ok(p._undo.length === 6, "undo depth capped at 6 levels");
+  p._undo = null;
+}
+
+// ---- memory: f32/i16 helpers ----
+{
+  const rt = new Float32Array([0, 0.5, -0.5, 1, -1, 0.123456, -0.987654]);
+  const i16 = SP._f32ToI16(rt);
+  ok(Object.prototype.toString.call(i16) === "[object Int16Array]", "f32ToI16 returns Int16Array");
+  ok(i16[3] === 32767 && i16[4] === -32768, "f32ToI16 uses full int16 range");
+  const back = SP._i16ToF32(i16);
+  let maxDiff = 0;
+  for (let i = 0; i < rt.length; i++) maxDiff = Math.max(maxDiff, Math.abs(back[i] - rt[i]));
+  ok(maxDiff < 1 / 32767 + 1e-6, "i16ToF32 round-trips within 16-bit rounding");
+}
+
+// ---- memory: AudioBuffer cache ----
+{
+  const p = SP.state.pads[5];
+  const fakeAC = ac();
+  const b1 = SP._padBuffer(fakeAC, p, true);
+  const b2 = SP._padBuffer(fakeAC, p, true);
+  ok(b1 === b2, "padBuffer returns the cached AudioBuffer on repeat triggers");
+  ok(b1.sampleRate === 26040, "cached SP buffer runs at 26.04 kHz");
+  const bc1 = SP._padBuffer(fakeAC, p, false);
+  ok(bc1 !== b1 && bc1.sampleRate === 44100, "clean-mode buffer cached separately at 44.1 kHz");
+  SP._invalidatePadBuffers(p);
+  const b3 = SP._padBuffer(fakeAC, p, true);
+  ok(b3 !== b1, "invalidatePadBuffers drops the cache so edits rebuild it");
+  // int16 12-bit values convert back to the right float grid
+  const ch = b3.getChannelData(0);
+  let onGrid = true;
+  for (let i = 0; i < Math.min(ch.length, 200); i += 7) {
+    if (Math.abs(ch[i] * 2047 - Math.round(ch[i] * 2047)) > 1e-3) { onGrid = false; break; }
+  }
+  ok(onGrid, "cached SP buffer audio sits on the 12-bit grid");
+}
