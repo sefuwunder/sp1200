@@ -76,6 +76,7 @@ FakeAC.instances = [];
 FakeAC.prototype.createBuffer = function (ch, len, rate) {
   const b = {
     sampleRate: rate,
+    duration: len / rate,
     _data: new Float32Array(len),
     copyToChannel: function (d) { this._data = Float32Array.from(d); },
     getChannelData: function () { return this._data; },
@@ -953,4 +954,70 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
     if (Math.abs(ch[i] * 2047 - Math.round(ch[i] * 2047)) > 1e-3) { onGrid = false; break; }
   }
   ok(onGrid, "cached SP buffer audio sits on the 12-bit grid");
+}
+
+// ---- sample loop points ----
+{
+  const p = SP.state.pads[6];
+  ok(p.loopOn === false && p.loopStart === 0 && p.loopEnd === 1, "loop defaults to off, full range");
+  // set loop from a selection through the editor buttons
+  ui.padEdit6.click();
+  p.selStart = 0.2; p.selEnd = 0.6;
+  const lb = SP._edLoopBtns();
+  ok(lb && !!lb.set && !!lb.toggle, "editor has SET LOOP and LOOP buttons");
+  const setLoop = lb.set, loopTgl = lb.toggle;
+  setLoop.click();
+  ok(p.loopOn === true, "SET LOOP enables looping");
+  ok(Math.abs(p.loopStart - 0.2) < 1e-9 && Math.abs(p.loopEnd - 0.6) < 1e-9, "SET LOOP takes points from the selection");
+  ok(loopTgl.classList.contains("on"), "LOOP toggle lights up");
+  // playback wires the native loop
+  SP._playPad(6);
+  const src = SP._ctx().lastSource;
+  ok(src.loop === true, "looping pad sets source.loop");
+  const dur = src.buffer.duration;
+  ok(Math.abs(src.loopStart - 0.2 * dur) < 1e-6 && Math.abs(src.loopEnd - 0.6 * dur) < 1e-6,
+    "loopStart/loopEnd map fractions onto the buffer");
+  // toggle off
+  loopTgl.click();
+  ok(p.loopOn === false && !loopTgl.classList.contains("on"), "LOOP toggle disables");
+  SP._playPad(6);
+  ok(SP._ctx().lastSource.loop !== true, "loop off leaves source.loop unset");
+  // degenerate region can't enable
+  p.loopStart = 0.5; p.loopEnd = 0.5;
+  loopTgl.click();
+  ok(p.loopOn === false, "zero-width loop region stays off");
+  // TRIM clears the loop (sample re-mapped)
+  p.loopStart = 0.2; p.loopEnd = 0.6; p.loopOn = true;
+  // TRIM through the real editor button: loop must clear (sample re-mapped)
+  p.selStart = 0; p.selEnd = 1;
+  function findBtn(root, label) {
+    if (root.textContent === label && root.tagName === "BUTTON") return root;
+    for (const c of (root.children || [])) {
+      const f = findBtn(c, label);
+      if (f) return f;
+    }
+    return null;
+  }
+  const realTrim = findBtn(SP._ed().root, "TRIM");
+  ok(!!realTrim, "found the real TRIM button");
+  realTrim.click();
+  ok(p.loopOn === false && p.loopStart === 0 && p.loopEnd === 1, "TRIM clears loop points");
+  ok(p.loopOn === false && p.loopStart === 0 && p.loopEnd === 1, "TRIM clears loop points");
+  SP._closeEditor();
+}
+
+// ---- loop persistence ----
+{
+  const p = SP.state.pads[7];
+  p.loopStart = 0.25; p.loopEnd = 0.75; p.loopOn = true;
+  SP._save();
+  const raw = JSON.parse(sandbox.localStorage.getItem("sp1200"));
+  const saved = raw.pads[7].loop;
+  ok(saved && saved.on === true && saved.start === 0.25 && saved.end === 0.75, "loop points persist per pad");
+  p.loopOn = false; p.loopStart = 0; p.loopEnd = 1;
+  SP._load();
+  const q = SP.state.pads[7];
+  ok(q.loopOn === true && q.loopStart === 0.25 && q.loopEnd === 0.75, "loop points restore on load");
+  q.loopOn = false; q.loopStart = 0; q.loopEnd = 1;
+  SP._save();
 }

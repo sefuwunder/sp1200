@@ -222,6 +222,12 @@
     if (typeof ps.filterQ === "number") state.pads[i].filterQ = clamp(ps.filterQ, 0.5, 8);
     if (ps.voiceMode === "mono" || ps.voiceMode === "poly") state.pads[i].voiceMode = ps.voiceMode;
     if (typeof ps.choke === "number") state.pads[i].choke = clamp(Math.round(ps.choke), 0, 3);
+    if (ps.loop) {
+      var lp = state.pads[i];
+      lp.loopStart = clamp(+ps.loop.start || 0, 0, 1);
+      lp.loopEnd = clamp(ps.loop.end == null ? 1 : +ps.loop.end, 0, 1);
+      lp.loopOn = !!ps.loop.on && lp.loopEnd > lp.loopStart;
+    }
     if (ps.delay) {
       var d = state.pads[i].delay;
       d.on = !!ps.delay.on;
@@ -237,6 +243,7 @@
       filterType: p.filterType, filterFreq: p.filterFreq, filterQ: p.filterQ,
       voiceMode: p.voiceMode, choke: p.choke,
       delay: { on: p.delay.on, time: p.delay.time, feedback: p.delay.feedback, mix: p.delay.mix },
+      loop: { on: !!p.loopOn, start: +p.loopStart || 0, end: p.loopEnd == null ? 1 : +p.loopEnd },
       custom: null, label: p.label || null,
     };
     if (p.customName && p.dataClean) o.custom = { name: p.customName, pcm: f32ToPcm16B64(p.dataClean) };
@@ -460,13 +467,21 @@
         if (c !== idx && state.pads[c].choke === p.choke) killStoreVoices(VS[c], t0);
       }
     }
-    // Mono: retriggering cuts this pad's own tail.
-    if (p.voiceMode === "mono") killStoreVoices(VS[idx], t0);
+    // Mono: retriggering cuts this pad's own tail. Looped pads always
+    // retrigger-cut too: a looping voice never ends on its own.
+    if (p.voiceMode === "mono" || p.loopOn) killStoreVoices(VS[idx], t0);
     var useSP = state.spMode;
     var buf = padBuffer(ac, p, useSP);
     var src = ac.createBufferSource();
     src.buffer = buf;
     src.playbackRate.value = p.tune * (rateMul || 1); // varispeed, exactly like the hardware
+    // Sample loop: the source cycles between the loop points until the voice
+    // is stopped (mono retrigger / choke / PANIC).
+    if (p.loopOn && p.loopEnd - p.loopStart > 1e-4) {
+      src.loop = true;
+      src.loopStart = clamp(p.loopStart, 0, 1) * buf.duration;
+      src.loopEnd = clamp(p.loopEnd, 0, 1) * buf.duration;
+    }
     var g = ac.createGain();
     g.gain.value = p.level;
     if (p.filterType !== "off") {
@@ -1037,6 +1052,7 @@
     p.customName = (name || "sample").replace(/\.\w+$/, "").slice(0, 12).toUpperCase();
     paintPadName(padIdx);
     p._undo = null;
+    p.loopOn = false; p.loopStart = 0; p.loopEnd = 1;
     p.selStart = 0; p.selEnd = 1;
     if (ui.edOpenFor === padIdx) syncEditor();
     playPad(padIdx, null, null, true);
@@ -1121,6 +1137,7 @@
     p.dataSP = DSP.SYNTHS_I16[p.def.id]();
     p.dataClean = DSP.SYNTHS_RAW[p.def.id]();
     invalidatePadBuffers(p);
+    p.loopOn = false; p.loopStart = 0; p.loopEnd = 1;
     p.customName = null;
     p.label = null;
     p._undo = null;
@@ -1266,6 +1283,7 @@
       if (b - a < 0.002) return; // nothing selected
       pushUndo(p);
       p.dataClean = DSP.trimSample(p.dataClean, a, b);
+      p.loopOn = false; p.loopStart = 0; p.loopEnd = 1; // trim re-maps the sample: old loop points are meaningless
       commitEdit(i);
     }, "Crop sample to selection");
     opBtn("NORM", function () {
@@ -1299,6 +1317,27 @@
         commitEdit(i);
       }
     }, "Undo last edit");
+    var setLoopBtn = opBtn("SET LOOP", function () {
+      var i = ui.edOpenFor, p = state.pads[i];
+      var a = Math.min(p.selStart, p.selEnd), b = Math.max(p.selStart, p.selEnd);
+      if (b - a < 0.002) { say("SELECT A REGION FIRST"); return; }
+      p.loopStart = a; p.loopEnd = b; p.loopOn = true;
+      paintLoop(); drawWave(); save();
+      say("LOOP SET");
+    }, "Loop the selected region: playback cycles between the selection edges");
+    var loopBtn = opBtn("LOOP", function () {
+      var i = ui.edOpenFor, p = state.pads[i];
+      p.loopOn = !p.loopOn;
+      // a degenerate loop (no region) can't play — treat as off
+      if (p.loopOn && p.loopEnd - p.loopStart < 1e-4) p.loopOn = false;
+      paintLoop(); drawWave(); save();
+      say(p.loopOn ? "LOOP ON" : "LOOP OFF");
+    }, "Toggle sample looping between the loop points");
+    function paintLoop() {
+      var p = state.pads[ui.edOpenFor];
+      loopBtn.classList.toggle("on", !!(p && p.loopOn));
+    }
+    paintLoop();
 
     var fsec = el("div", "ed-filter", panel);
     var flab = el("div", "ed-flab", fsec);
@@ -1345,7 +1384,7 @@
       function (v) { var p = state.pads[ui.edOpenFor]; p.delay.mix = v / 100; if (ctx) syncDelay(ui.edOpenFor); save(); });
 
     ed = { root: root, title: title, canvas: cv, info: info, ftypeBtns: ftypeBtns, cutoff: cutoff, reso: reso,
-           dOn: dOnBtn, dTime: dTime, dFdbk: dFdbk, dMix: dMix };
+           dOn: dOnBtn, dTime: dTime, dFdbk: dFdbk, dMix: dMix, loopBtn: loopBtn, setLoopBtn: setLoopBtn };
   }
   function paintDelay() {
     if (!ed) return;
@@ -1370,6 +1409,7 @@
     ed.dTime.set(p.delay.time * 100);
     ed.dFdbk.set(p.delay.feedback * 100);
     ed.dMix.set(p.delay.mix * 100);
+    if (ed.loopBtn) ed.loopBtn.classList.toggle("on", !!p.loopOn);
     drawWave();
   }
   function openEditor(i) {
@@ -1418,10 +1458,23 @@
     g2d.fillStyle = "#ffd47a";
     g2d.fillRect(s0 - 1, 0, 2, H);
     g2d.fillRect(s1 - 1, 0, 2, H);
+    // loop region: gold band + edge ticks when looping is on
+    if (p.loopOn && p.loopEnd > p.loopStart) {
+      var l0 = clamp(p.loopStart, 0, 1) * W, l1 = clamp(p.loopEnd, 0, 1) * W;
+      g2d.fillStyle = "rgba(240,180,41,0.16)";
+      g2d.fillRect(l0, 0, l1 - l0, H);
+      g2d.fillStyle = "#f0b429";
+      g2d.fillRect(l0 - 1, 0, 2, H);
+      g2d.fillRect(l1 - 1, 0, 2, H);
+    }
     var secs = d.length / DSP.SYNTH_RATE;
     ed.info.textContent = secs.toFixed(2) + "s \u00b7 " + d.length + " samples \u00b7 sel " +
       (Math.min(p.selStart, p.selEnd) * secs).toFixed(2) + "\u2013" +
-      (Math.max(p.selStart, p.selEnd) * secs).toFixed(2) + "s \u00b7 drag to select, TRIM crops";
+      (Math.max(p.selStart, p.selEnd) * secs).toFixed(2) + "s" +
+      (p.loopOn && p.loopEnd > p.loopStart
+        ? " \u00b7 loop " + (p.loopStart * secs).toFixed(2) + "\u2013" + (p.loopEnd * secs).toFixed(2) + "s"
+        : "") +
+      " \u00b7 drag to select, TRIM crops";
   }
 
   // ---------------- tape slicer ----------------
@@ -1966,6 +2019,7 @@
     var p = state.pads[padIdx];
     pushUndo(p);
     p.dataClean = cut;
+    p.loopOn = false; p.loopStart = 0; p.loopEnd = 1; // fresh sample, no loop yet
     refreshSample(padIdx); // re-derive the 12-bit SP buffer
     p.customName = ("SLC " + (sl.selSeg + 1)).slice(0, 12).toUpperCase();
     paintPadName(padIdx);
@@ -2622,6 +2676,7 @@
         choke: (def.id === "chat" || def.id === "ohat") ? 1 : 0,  // 0=off, 1..3 = groups A/B/C
         delay: { on: false, time: 0.32, feedback: 0.35, mix: 0.3 },
         selStart: 0, selEnd: 1, _undo: null, _voices: [], _delay: null,
+        loopStart: 0, loopEnd: 1, loopOn: false,
       });
       state.pattern.push(new Array(STEPS).fill(0));
     });
@@ -2666,6 +2721,10 @@
     _refreshSample: refreshSample, _drawWave: drawWave,
     _padBuffer: padBuffer, _invalidatePadBuffers: invalidatePadBuffers,
     _f32ToI16: f32ToI16, _i16ToF32: i16ToF32, _pushUndo: pushUndo,
+    _edLoopBtns: function () { return ed ? { set: ed.setLoopBtn, toggle: ed.loopBtn } : null; },
+    _ctx: function () { ensureAudio(); return ctx; },
+    _ed: function () { return ed; },
+    _save: save, _load: load,
     _openSlicer: openSlicer, _closeSlicer: closeSlicer,
     _slicerSetTape: slicerSetTape, _slicerEqual: slicerEqual, _slicerAuto: slicerAuto,
     _slicerSegments: slicerSegments, _auditionSegment: auditionSegment, _sliceToPad: sliceToPad,
