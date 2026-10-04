@@ -503,6 +503,9 @@ ok(vsaved.pads[2].delay.on === false, "delay disable persists to localStorage");
 ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to localStorage");
 
 // ---- tape: bounce + 4-track arranger (async) ----
+// handshake: the tape-take block below waits for this one, so the two
+// async blocks never interleave their FakeOAC instances.
+var bounceDone = false;
 (async function () {
   ok(SP.state.tapes.length === 4, "four tape tracks exist");
   ok(SP.state.tapes.every(function (t) { return !t.buffer; }), "tracks ship empty");
@@ -908,6 +911,7 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
   ok(SP._recArmed() === false, "REC disarmed after the record tests");
 
   console.log("\nui: " + n + " passed");
+  bounceDone = true;
 })().catch(function (e) { console.error("TAPE TESTS FAILED:", e); process.exit(1); });
 
 // ---- memory: int16 undo round-trip ----
@@ -1034,3 +1038,95 @@ ok(Math.abs(vsaved.pads[2].delay.time - 0.5) < 1e-9, "delay time persists to loc
   q.loopOn = false; q.loopStart = 0; q.loopEnd = 1;
   SP._save();
 }
+
+// ---- tape take: record live pad input to tape (async) ----
+(async function () {
+  while (!bounceDone) await new Promise(function (r) { setTimeout(r, 10); });
+  // start from a clean tape state regardless of what the bounce block left
+  SP._tapeStopAll();
+  SP.state.tapes.forEach(function (t) { t.buffer = null; t.bouncing = false; });
+  ui.tapeBtn.click();
+  const tp = SP._tape();
+  ok(!!tp.rows[0].recBtn && tp.rows[0].recBtn.textContent === "\u25cf REC", "each track has a REC button");
+  const ctx = SP._ctx();
+
+  // arm track 0
+  SP._tapeRecArm(0);
+  let rec = SP._tapeRec();
+  ok(!!rec && rec.track === 0 && rec.events.length === 0, "REC arms an empty track");
+  ok(tp.rows[0].recBtn.textContent === "\u25a0 STOP", "armed track's REC becomes STOP");
+  ok(tp.rows[0].root.classList.contains("recording"), "armed track is highlighted");
+  ok(tp.rows[0].status.textContent.indexOf("REC") === 0, "status shows REC while armed");
+
+  // live hits land as timed events; scheduled ones don't
+  ctx.currentTime = 0.5;
+  SP._maybeTapeRec(2);
+  ctx.currentTime = 1.25;
+  SP._maybeTapeRec(5);
+  rec = SP._tapeRec();
+  ok(rec.events.length === 2, "two live hits captured");
+  ok(rec.events[0].pad === 2 && Math.abs(rec.events[0].t - 0.5) < 1e-9, "first hit timed from arm");
+  ok(rec.events[1].pad === 5 && Math.abs(rec.events[1].t - 1.25) < 1e-9, "second hit timed from arm");
+  SP._playPad(0, 9.9); // scheduled (when != null) — never records
+  ok(SP._tapeRec().events.length === 2, "scheduled playback never lands on tape");
+
+  // the real user path: keyboard 1-8 while armed
+  ctx.currentTime = 2.0;
+  listeners.keydown({ key: "3", target: {} });
+  rec = SP._tapeRec();
+  ok(rec.events.length === 3 && rec.events[2].pad === 2 && Math.abs(rec.events[2].t - 2.0) < 1e-9,
+    "keyboard pad hit records onto the armed take");
+
+  // re-arming the same track toggles off and renders
+  SP._tapeRecArm(0);
+  await new Promise(function (r) { setTimeout(r, 20); });
+  const t0 = SP.state.tapes[0];
+  ok(!SP._tapeRec(), "disarm clears the armed take");
+  ok(!!t0.buffer && t0.name === "TAKE 1", "take renders to the track");
+  ok(!!t0._src && t0._src.loop === true, "take auto-loops like a bounce");
+  const ocx = FakeAC.instances[FakeAC.instances.length - 1];
+  const hits = ocx.sources.map(function (r) { return r.at; }).sort(function (a, b) { return a - b; });
+  ok(hits.length === 3, "render schedules every captured hit");
+  ok(Math.abs(hits[0] - 0.5) < 1e-9 && Math.abs(hits[2] - 2.0) < 1e-9, "render preserves hit timing");
+  ok(t0.buffer.length > Math.ceil(2.0 * 44100), "take buffer covers last hit plus tail");
+
+  // arming a non-empty track is refused
+  SP._tapeRecArm(0);
+  ok(!SP._tapeRec(), "REC refuses a track that already has audio");
+
+  // one take at a time
+  SP._tapeRecArm(1);
+  SP._tapeRecArm(2);
+  ok(SP._tapeRec().track === 1, "arming a second track keeps the first armed");
+
+  // empty take: no render, track stays empty
+  SP._tapeRecFinish();
+  await new Promise(function (r) { setTimeout(r, 20); });
+  ok(!SP.state.tapes[1].buffer, "empty take leaves the track empty");
+
+  // T key: arms first empty track, then finishes
+  listeners.keydown({ key: "t", target: {} });
+  ok(SP._tapeRec() && SP._tapeRec().track === 1, "T arms the first empty track");
+  ctx.currentTime = 3.0;
+  SP.state.pads[0].muted = false; // project tests may have left it muted; muted pads never sound
+  listeners.keydown({ key: "1", target: {} }); // one hit in the take
+  ctx.currentTime = 100; // past the 60s cap
+  SP._maybeTapeRec(0);
+  ok(!SP._tapeRec(), "take auto-finishes past the length cap");
+  await new Promise(function (r) { setTimeout(r, 20); });
+  ok(!!SP.state.tapes[1].buffer, "capped take still renders");
+  listeners.keydown({ key: "T", target: {} });
+  ok(SP._tapeRec() && SP._tapeRec().track === 2, "T arms the next empty track");
+  listeners.keydown({ key: "t", target: {} });
+  await new Promise(function (r) { setTimeout(r, 20); });
+  ok(!SP._tapeRec() && !SP.state.tapes[2].buffer, "T finishes an empty armed take without rendering");
+  ok(tp.rows[2].status.textContent === "EMPTY", "emptied take reads EMPTY");
+
+  // clear disarms
+  SP._tapeRecArm(3);
+  ok(!!SP._tapeRec(), "track 3 armed");
+  tp.rows[3].clearBtn.click();
+  ok(!SP._tapeRec(), "CLEAR disarms the take");
+
+  console.log("\nui+take: " + n + " passed");
+})().catch(function (e) { console.error("TAKE TESTS FAILED:", e); process.exit(1); });

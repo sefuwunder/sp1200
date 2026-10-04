@@ -520,9 +520,10 @@
     playPadOn(ctx, masterGain, idx, when == null ? ctx.currentTime : when, liveVS(), rateMul);
     flashPad(idx);
     // live record: real pad hits (keys, strips, KEYS mode) punch into the
-    // pattern while REC is armed and the transport runs; auditions and
+    // pattern while REC is armed and the transport runs; a tape take
+    // captures the same hits as timed events; auditions and
     // scheduled pattern playback never record
-    if (when == null && !audition) maybeRecord(idx);
+    if (when == null && !audition) { maybeRecord(idx); maybeTapeRec(idx); }
   }
 
   // ---------------- sequencer ----------------
@@ -746,8 +747,94 @@
 
   function tapeClear(i) {
     tapeStop(i);
+    if (tapeRec && tapeRec.track === i) { clearInterval(tapeRec.timer); tapeRec = null; }
     state.tapes[i] = freshTape(i);
     paintTape();
+  }
+
+  // ---------------- tape take: record live pad input ----------------
+  // Arm a track, play the pads live (keyboard 1-8, strips, KEYS mode),
+  // disarm — the take renders offline through the SP path and loops,
+  // exactly like a bounce. Timing is captured as events; the render
+  // uses the pads' current settings, same as BOUNCE.
+  var tapeRec = null; // { track, events: [{pad, t}], t0, timer }
+  var TAPE_TAKE_MAX = 60; // seconds; the take auto-finishes here
+
+  function tapeRecDur() {
+    if (!tapeRec || !ctx) return "0:00";
+    var s = Math.max(0, ctx.currentTime - tapeRec.t0);
+    return Math.floor(s / 60) + ":" + ("0" + Math.floor(s % 60)).slice(-2);
+  }
+  function tapeRecArm(i) {
+    var t = state.tapes[i];
+    if (!t || t.bouncing) return;
+    if (tapeRec) {
+      if (tapeRec.track === i) { tapeRecFinish(); return; } // toggle off
+      say("FINISH THE ARMED TAKE FIRST");
+      return;
+    }
+    if (t.buffer) { say("CLEAR TRACK FIRST"); return; }
+    ensureAudio();
+    tapeStop(i);
+    tapeRec = { track: i, events: [], t0: ctx.currentTime,
+                timer: setInterval(paintTape, 500) };
+    say("TAPE REC — TRACK " + (i + 1) + " — PLAY THE PADS");
+    paintTape();
+  }
+  // T arms the first empty track, or finishes the armed take.
+  function tapeRecToggle() {
+    if (tapeRec) { tapeRecFinish(); return; }
+    for (var i = 0; i < TAPE_COUNT; i++) {
+      if (!state.tapes[i].buffer && !state.tapes[i].bouncing) { tapeRecArm(i); return; }
+    }
+    say("NO EMPTY TRACK");
+  }
+  function maybeTapeRec(idx) {
+    if (!tapeRec || !ctx) return;
+    var dt = ctx.currentTime - tapeRec.t0;
+    if (dt > TAPE_TAKE_MAX) { tapeRecFinish(); return; }
+    tapeRec.events.push({ pad: idx, t: dt });
+    paintTape();
+  }
+  function tapeRecFinish() {
+    var rec = tapeRec; tapeRec = null;
+    if (rec) clearInterval(rec.timer);
+    if (!rec) { paintTape(); return; }
+    var t = state.tapes[rec.track];
+    if (!t) { paintTape(); return; }
+    if (!rec.events.length) { say("TAKE EMPTY"); paintTape(); return; }
+    var OC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!OC) { say("RENDER FAILED"); paintTape(); return; }
+    t.bouncing = true; // reuse the "render in progress" indicator
+    paintTape();
+    renderTapeTake(rec.events).then(function (buf) {
+      t.buffer = buf; t.bars = 0; t.bpm = state.bpm;
+      t.name = "TAKE " + (rec.track + 1);
+      t.bouncing = false;
+      paintTape();
+      drawTapeWave(rec.track);
+      tapePlay(rec.track); // straight onto the loop
+      say("TAKE ON TRACK " + (rec.track + 1));
+    }, function () {
+      t.bouncing = false; t.bounceError = true; paintTape();
+    });
+  }
+  // Render captured pad hits to a stereo buffer, through the SP path.
+  function renderTapeTake(events) {
+    var OC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    var tail = 2.0; // let the last hit's tail ring out
+    var dur = events.length ? events[events.length - 1].t + tail : 1;
+    var oc = new OC(2, Math.max(1, Math.ceil(dur * BOUNCE_SR)), BOUNCE_SR);
+    var master = oc.createGain();
+    master.gain.value = state.master / 100;
+    var comp = oc.createDynamicsCompressor();
+    comp.threshold.value = -18;
+    comp.ratio.value = 4;
+    master.connect(comp);
+    comp.connect(oc.destination);
+    var VS = state.pads.map(function () { return newVoiceStore(); });
+    events.forEach(function (ev) { playPadOn(oc, master, ev.pad, ev.t, VS); });
+    return oc.startRendering();
   }
 
   function bounceToTape(i) {
@@ -1692,6 +1779,8 @@
           return b;
         }
         var bounceBtn = tbtn("BOUNCE", bounceToTape, "Bounce the pattern onto this track");
+        var recBtn = tbtn("\u25cf REC", tapeRecArm, "Record live pad hits onto this track (keys 1-8)");
+        recBtn.classList.add("warn");
         var muteBtn = tbtn("MUTE", tapeToggleMute, "Mute this track");
         var sliceBtn = tbtn("\u2192SLICER", tapeToSlicer, "Send this track to the tape slicer");
         var clearBtn = tbtn("CLEAR", tapeClear, "Clear this track");
@@ -1699,13 +1788,13 @@
           function (v) { return Math.round(v) + "%"; },
           function (v) { tapeSetLevel(ti, v / 100); });
         rows.push({ root: tr, name: tname, status: tstatus, canvas: cv,
-                    bounceBtn: bounceBtn, muteBtn: muteBtn, sliceBtn: sliceBtn,
+                    bounceBtn: bounceBtn, recBtn: recBtn, muteBtn: muteBtn, sliceBtn: sliceBtn,
                     clearBtn: clearBtn, level: lvl });
       })(i);
     }
 
     var hint = el("div", "ed-hint", panel);
-    hint.textContent = "BOUNCE renders the current pattern (swing, choke, mono, filters, delay) to tape and loops it. Tracks loop independently — layer them under the live sequencer. Tapes live in memory until reload.";
+    hint.textContent = "BOUNCE renders the current pattern (swing, choke, mono, filters, delay) to tape and loops it. \u25cf REC arms a track: play the pads live (keys 1\u20138), press REC again (or T) and the take renders to tape. Tracks loop independently — layer them under the live sequencer. Tapes live in memory until reload.";
 
     tp = { root: root, title: title, barsBtn: barsBtn, rows: rows };
     ui.tapeBars = ui.tapeBars || 2;
@@ -1739,12 +1828,17 @@
     for (var i = 0; i < TAPE_COUNT; i++) {
       var t = state.tapes[i], r = tp.rows[i];
       if (!t) continue;
+      var rec = tapeRec && tapeRec.track === i;
       r.name.textContent = t.name;
-      r.status.textContent = t.bouncing ? "BOUNCING\u2026" :
+      r.status.textContent = rec ? "REC \u25cf " + tapeRecDur() :
+        t.bouncing ? "BOUNCING\u2026" :
         t.bounceError ? "RENDER FAILED" :
         t.buffer ? tapeDurStr(t) : "EMPTY";
       r.root.classList.toggle("playing", !!t._src);
+      r.root.classList.toggle("recording", !!rec);
       r.bounceBtn.textContent = t.bouncing ? "\u2026" : "BOUNCE";
+      r.recBtn.textContent = rec ? "\u25a0 STOP" : "\u25cf REC";
+      r.recBtn.classList.toggle("on", !!rec);
       r.muteBtn.classList.toggle("on", t.muted);
       r.sliceBtn.classList.toggle("dim", !t.buffer);
       r.level.set(t.level * 100);
@@ -2614,7 +2708,7 @@
     paintSlots();
 
     var foot = el("div", "foot", app);
-    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; <kbd>R</kbd> arm live record &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; click a voice name for KEYS mode &nbsp;·&nbsp; LOAD / MIC put your own samples through the 12-bit path &nbsp;·&nbsp; hold a PUNCH-IN FX key to bend the master bus &nbsp;·&nbsp; SLICE chops a long sample across the pads &nbsp;·&nbsp; MONO / CHK voice modes per strip &nbsp;·&nbsp; delay lives in EDIT &nbsp;·&nbsp; TAPE bounces the pattern to a 4-track loop &nbsp;·&nbsp; PROJECTS 1-3 are factory grooves, 4-9 are yours";
+    foot.innerHTML = "<kbd>Space</kbd> play / stop &nbsp;·&nbsp; <kbd>1</kbd>–<kbd>8</kbd> trigger pads &nbsp;·&nbsp; <kbd>R</kbd> arm live record &nbsp;·&nbsp; <kbd>T</kbd> tape take rec &nbsp;·&nbsp; click steps to program &nbsp;·&nbsp; click a voice name for KEYS mode &nbsp;·&nbsp; LOAD / MIC put your own samples through the 12-bit path &nbsp;·&nbsp; hold a PUNCH-IN FX key to bend the master bus &nbsp;·&nbsp; SLICE chops a long sample across the pads &nbsp;·&nbsp; MONO / CHK voice modes per strip &nbsp;·&nbsp; delay lives in EDIT &nbsp;·&nbsp; TAPE bounces the pattern to a 4-track loop &nbsp;·&nbsp; PROJECTS 1-3 are factory grooves, 4-9 are yours";
 
     // ---- keyboard ----
     document.addEventListener("keydown", function (e) {
@@ -2625,6 +2719,8 @@
         if (state.playing || anyTapePlaying()) globalStop(); else globalPlay();
       } else if (e.key === "r" || e.key === "R") {
         toggleRec();
+      } else if (e.key === "t" || e.key === "T") {
+        tapeRecToggle();
       } else {
         var n = parseInt(e.key, 10);
         if (n >= 1 && n <= 8) playPad(n - 1);
@@ -2740,6 +2836,9 @@
     _editor: function () { return ed; }, _paintChoke: paintChoke, _paintVoiceMode: paintVoiceMode,
     _openTape: openTape, _closeTape: closeTape, _tape: function () { return tp; },
     _renderPattern: renderPattern, _bounceToTape: bounceToTape,
+    _tapeRecArm: tapeRecArm, _tapeRecToggle: tapeRecToggle, _tapeRecFinish: tapeRecFinish,
+    _maybeTapeRec: maybeTapeRec, _renderTapeTake: renderTapeTake,
+    _tapeRec: function () { return tapeRec; }, _tapeRecDur: tapeRecDur,
     _tapePlay: tapePlay, _tapeStop: tapeStop, _tapePlayAll: tapePlayAll, _tapeStopAll: tapeStopAll,
     _tapeToSlicer: tapeToSlicer,
     _globalPlay: globalPlay, _globalStop: globalStop, _panic: panic,

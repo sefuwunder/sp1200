@@ -508,6 +508,7 @@ canvas.wave {
   background: rgba(255,255,255,.35); border: 1px solid var(--cream-line);
   border-radius: 10px; padding: 10px 12px;
 }
+.tp-track.recording { border-color: #d63c2f; box-shadow: 0 0 0 1px #d63c2f, 0 0 12px rgba(214,60,47,.35); }
 .tp-thead { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
 .tp-tname { font-size: 11px; font-weight: 900; letter-spacing: 2px; }
 .tp-status {
