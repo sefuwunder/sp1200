@@ -31,9 +31,14 @@ bun start   # http://localhost:3007
 
 The whole machine fits a 1920×1080 screen with no scrolling: the layout is condensed and PUNCH-IN FX sits beside PROJECTS on wide displays. On shorter viewports the machine scales down just enough to fit (never up, never below 72%).
 
+## Demonscene edition
+
+`/demo.html` — a second, fully independent interface in the 16-bit demo-scene spirit: copper bars, raster bars, starfield, and a sine-wave scroller, rendered chunky on a 480×270 canvas under CRT scanlines. It is **keyboard-only** — there is nothing to click. `A S D F J K L ;` fire the pads, `Space` runs the sequencer, arrows + `Enter` program the 8×16 grid, `1`–`4` load factory breaks, `R` summons chaos, `H` shows the full key map. Same 12-bit voices and Roger Linn swing as the main machine, pattern persists in localStorage. Open http://localhost:3007/demo.html.
+
 ## Layout
 
 - `src/server.ts` — Bun static server (port 3007)
 - `public/dsp.js` — pure DSP: drum synthesis, the 26.04 kHz / 12-bit pipeline, swing math. Runs in node too (`require("./public/dsp.js")`)
 - `public/app.js` — UI, Web Audio voices, lookahead sequencer
+- `public/demo.html`, `public/demo.js`, `public/demo.css` — the keyboard-only demoscene interface
 - `public/style.css`, `public/index.html`

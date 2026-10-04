@@ -7,6 +7,9 @@ import indexHtml from "../public/index.html" with { type: "text" };
 import appJs from "../public/app.js" with { type: "text" };
 import dspJs from "../public/dsp.js" with { type: "text" };
 import styleCss from "../public/style.css" with { type: "text" };
+import demoHtml from "../public/demo.html" with { type: "text" };
+import demoJs from "../public/demo.js" with { type: "text" };
+import demoCss from "../public/demo.css" with { type: "text" };
 
 const ASSETS: Record<string, { body: string; type: string }> = {
   "/": { body: indexHtml, type: "text/html; charset=utf-8" },
@@ -14,6 +17,9 @@ const ASSETS: Record<string, { body: string; type: string }> = {
   "/app.js": { body: appJs, type: "text/javascript; charset=utf-8" },
   "/dsp.js": { body: dspJs, type: "text/javascript; charset=utf-8" },
   "/style.css": { body: styleCss, type: "text/css; charset=utf-8" },
+  "/demo.html": { body: demoHtml, type: "text/html; charset=utf-8" },
+  "/demo.js": { body: demoJs, type: "text/javascript; charset=utf-8" },
+  "/demo.css": { body: demoCss, type: "text/css; charset=utf-8" },
 };
 
 const port = Number(process.env.PORT || 0);

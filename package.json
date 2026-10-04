@@ -3,7 +3,7 @@
   "private": true,
   "scripts": {
     "start": "bun src/server.ts",
-    "test": "node tests/dsp.test.js && node tests/ui.test.js"
+    "test": "node tests/dsp.test.js && node tests/ui.test.js && node tests/demo.test.js"
   },
   "version": "1.0.0"
 }
