@@ -1157,9 +1157,12 @@ var bounceDone = false;
   ctx.currentTime = 3.0;
   SP.state.pads[0].muted = false; // project tests may have left it muted; muted pads never sound
   listeners.keydown({ key: "1", target: {} }); // one hit in the take
-  ctx.currentTime = 100; // past the 60s cap
+  ctx.currentTime = 91.9; // just under the 90s cap (t0 was 2.0)
   SP._maybeTapeRec(0);
-  ok(!SP._tapeRec(), "take auto-finishes past the length cap");
+  ok(!!SP._tapeRec(), "take keeps recording just under the 90s cap");
+  ctx.currentTime = 92.1; // past the 90s cap
+  SP._maybeTapeRec(0);
+  ok(!SP._tapeRec(), "take auto-finishes past the 90s cap");
   await new Promise(function (r) { setTimeout(r, 20); });
   ok(!!SP.state.tapes[1].buffer, "capped take still renders");
   listeners.keydown({ key: "T", target: {} });

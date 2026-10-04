@@ -758,7 +758,7 @@
   // exactly like a bounce. Timing is captured as events; the render
   // uses the pads' current settings, same as BOUNCE.
   var tapeRec = null; // { track, events: [{pad, t}], t0, timer }
-  var TAPE_TAKE_MAX = 60; // seconds; the take auto-finishes here
+  var TAPE_TAKE_MAX = 90; // seconds; the take auto-finishes here
 
   function tapeRecDur() {
     if (!tapeRec || !ctx) return "0:00";
