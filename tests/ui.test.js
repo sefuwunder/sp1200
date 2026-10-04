@@ -378,6 +378,53 @@ ok(SP._slicerSegments().length === 1, "cropped tape is a single segment");
 SP._slicerUndo();
 ok(sl.tape.length === SR * 2, "UNDO restores the full tape after crop");
 
+// TRIM works on tape edges: first segment's leading silence, last segment's
+// trailing silence, and a whole un-sliced tape (previously all no-ops)
+SP._slicerSetTape(burstTape(SR, [0.25, 0.75, 1.25, 1.75]), "edgetrim");
+sl.nInput.value = 4;
+SP._slicerEqual();
+const edgeMarksBefore = sl.markers.length;
+SP._auditionSegment(0);
+const edge0Before = SP._slicerSegments()[0];
+SP._slicerTrim();
+let segsE = SP._slicerSegments();
+let tight0 = segsE[sl.selSeg];
+ok(tight0.start > edge0Before.start, "TRIM tightens the first segment's leading edge");
+ok(Math.abs(tight0.start / SR - 0.25) < 0.02, "first-segment trim sits on the hit");
+ok(sl.markers.length === edgeMarksBefore + 1, "edge trim plants exactly one marker");
+ok(segsE[0].end === tight0.start, "the trimmed-off silence becomes its own leading sliver");
+// re-trimming the tight segment plants no duplicate marker
+const dupBefore = sl.markers.length;
+SP._slicerTrim();
+ok(sl.markers.length === dupBefore, "re-trimming adds no duplicate marker");
+
+// last segment: trailing edge
+SP._slicerSetTape(burstTape(SR, [0.25, 0.75, 1.25, 1.75]), "edgetrim2");
+sl.nInput.value = 4;
+SP._slicerEqual();
+SP._auditionSegment(3);
+const edge3Before = SP._slicerSegments()[3];
+SP._slicerTrim();
+segsE = SP._slicerSegments();
+const tight3 = segsE[sl.selSeg];
+ok(tight3.end < edge3Before.end, "TRIM tightens the last segment's trailing edge");
+ok(Math.abs(tight3.end / SR - 1.75) < 0.08, "last-segment trim ends near the hit tail");
+
+// single un-sliced tape: both edges trim
+SP._slicerSetTape(burstTape(SR, [0.5, 1.5]), "wholetrim");
+ok(SP._slicerSegments().length === 1, "fresh tape is one segment");
+SP._auditionSegment(0);
+SP._slicerTrim();
+segsE = SP._slicerSegments();
+const tightW = segsE[sl.selSeg];
+ok(sl.markers.length === 2, "whole-tape trim plants both edge markers");
+ok(tightW.start > 0 && tightW.end < SR * 2, "whole-tape trim tightens both edges");
+ok(Math.abs(tightW.start / SR - 0.5) < 0.02 && Math.abs(tightW.end / SR - 1.5) < 0.08,
+  "whole-tape trim sits on the first/last hits");
+// UNDO restores the untrimmed tape
+SP._slicerUndo();
+ok(sl.markers.length === 0 && SP._slicerSegments().length === 1, "UNDO restores the untrimmed whole tape");
+
 // PANIC in the slicer stops the audition
 ok(sl.panicBtn && sl.panicBtn.textContent === "PANIC", "slicer has a PANIC button");
 ok(sl.panicBtn.classList.contains("panic"), "slicer PANIC uses the panic styling");

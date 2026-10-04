@@ -2071,7 +2071,8 @@
   function slicerTrim() {
     // Tighten the selected segment: move its bounding markers inward to the
     // first/last sample above the silence threshold. Tape edges have no
-    // marker, so they stay put.
+    // marker, so one is planted at the tightened bound — otherwise trimming
+    // the first/last segment (or a whole un-sliced tape) silently does nothing.
     var segs = slicerSegments();
     var i = Math.min(sl.selSeg, segs.length - 1);
     if (!sl || !sl.tape || !segs[i]) return;
@@ -2090,7 +2091,22 @@
       if (Math.abs(sl.markers[k] - f0) < eps) sl.markers[k] = s / n;
       else if (Math.abs(sl.markers[k] - f1) < eps) sl.markers[k] = e / n;
     }
+    // Plant edge markers so the trim sticks; skip if a marker is already there
+    // (e.g. re-trimming moves the planted one via the loop above).
+    var hasNear = function (f) {
+      for (var q = 0; q < sl.markers.length; q++)
+        if (Math.abs(sl.markers[q] - f) < eps) return true;
+      return false;
+    };
+    if (i === 0 && s > seg.start && !hasNear(s / n)) sl.markers.push(s / n);
+    if (i === segs.length - 1 && e < seg.end && !hasNear(e / n)) sl.markers.push(e / n);
+    // Re-resolve the selection: planting a leading marker shifts the
+    // tightened segment's index (the silence sliver sorts before it).
+    var segs2 = slicerSegments();
     sl.selSeg = i;
+    for (var j = 0; j < segs2.length; j++) {
+      if (Math.abs(segs2[j].start - s) <= 2) { sl.selSeg = j; break; }
+    }
     stopSlicerAudition();
     syncSlicer();
   }
