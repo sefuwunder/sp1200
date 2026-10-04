@@ -27,6 +27,7 @@ bun start   # http://localhost:3007
 - **PUNCH-IN FX** — six momentary keys (LP filter, 4-bit crusher, 16th-note stutter, drive, chorus, slapback delay) that bend the master bus while held and vanish on release.
 - **KEYS mode** — click a voice name in the STEP COMPOSER to turn its 16 keys chromatic (-8…+7 semitones) for pitched performance; click again to return to step programming.
 - **PROJECTS** — 9 slots: 1–3 hold factory grooves (Boom Bap, Trap, House), 4–9 are yours (STORE + tap a slot). Tap a slot to load, plus EXPORT / IMPORT / NEW.
+- **TAPE** — a 4-track loop arranger. BOUNCE renders the pattern to a track; **● REC** arms a track and records your live pad playing (keys `1`–`8`, strips, KEYS mode — or `T` to arm the first empty track) as a take, rendered through the SP path and looped. Tracks loop independently under the live sequencer; →SLICER sends a track to the slicer.
 - Everything else — pattern, tempo, swing, and pad settings — persists in localStorage.
 
 The whole machine fits a 1920×1080 screen with no scrolling: the layout is condensed and PUNCH-IN FX sits beside PROJECTS on wide displays. On shorter viewports the machine scales down just enough to fit (never up, never below 72%).
